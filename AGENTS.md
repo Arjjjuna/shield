@@ -37,6 +37,14 @@ root unless noted:
 - Store: `~/.local/share/shield/first-seen.tsv`
 - Config: `~/.config/shield/config.toml`
 
+## Version control
+
+`scm = git`, declared in `.opencode/workflow.jsonc`. Commits happen at workflow
+checkpoints, only after `review` passes its secret gate. The agent commits
+locally via `/commit`; **pushing is always manual and always yours.** To move to
+GitHub, add a remote and set `.opencode/workflow.jsonc` to `github`; `/commit`
+then prints the `git push` command for you to run.
+
 ## eframe / egui 0.36 gotchas (hard-won — do not fight these)
 
 - `eframe::App` requires `fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame)`.
