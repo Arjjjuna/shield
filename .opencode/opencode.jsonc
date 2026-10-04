@@ -1,0 +1,11 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  // Project override layer (applied after the direct config). Shield opted into
+  // `git` mode, so it grants exactly the two commands `/commit` needs. Nothing
+  // else is added; `git push` stays hard-denied by the umbrella policy.
+  "permissions": [
+    { "action": "shell", "resource": "git add -- *", "effect": "allow" },
+    { "action": "shell", "resource": "git commit -m *", "effect": "allow" }
+  ]
+}

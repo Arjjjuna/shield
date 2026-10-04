@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Shield
+Comment=Calm local network monitor (starts hidden in the tray)
+Exec=@EXEC@ --hidden
+Icon=security-high
+Terminal=false
+X-GNOME-Autostart-enabled=true
+StartupNotify=false

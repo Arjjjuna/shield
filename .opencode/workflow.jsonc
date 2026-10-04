@@ -1,0 +1,5 @@
+{
+  // Source-control mode for Shield. See the umbrella AGENTS.md, "Version
+  // control". Change to "none" or "github" here; nothing else moves.
+  "scm": "git"
+}

@@ -1,0 +1,25 @@
+/target
+Cargo.lock.bak
+
+# Secrets (first line of defense; the review secret gate is the backstop)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa*
+id_ed25519*
+.netrc
+credentials*
+*secret*
+
+# Review checkpoint marker (never commit it)
+.opencode/.review-ok
+
+# Local wiring: symlinks into the workflow pack, recreated per machine
+.opencode/agents
+.opencode/commands

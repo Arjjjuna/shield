@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Shield
+GenericName=Network Sentinel
+Comment=Calm local network monitor
+Exec=@EXEC@
+Icon=security-high
+Terminal=false
+Categories=System;Security;Monitor;
+Keywords=network;security;monitor;
+StartupNotify=false
