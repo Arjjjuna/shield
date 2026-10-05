@@ -3,11 +3,11 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
-use shield_core::{Alert, Config, Connection, FirstSeen};
+use shield_core::{Alert, Config, Connection, Destinations};
 
 /// State shared across threads. Everything is small and lock held briefly.
 pub struct Shared {
-    pub store: Mutex<FirstSeen>,
+    pub store: Mutex<Destinations>,
     pub config: Mutex<Config>,
     pub quit: AtomicBool,
     pub show: AtomicBool,
@@ -18,7 +18,7 @@ pub struct Shared {
 }
 
 impl Shared {
-    pub fn new(store: FirstSeen, config: Config) -> Self {
+    pub fn new(store: Destinations, config: Config) -> Self {
         Self {
             store: Mutex::new(store),
             config: Mutex::new(config),

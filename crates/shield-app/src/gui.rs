@@ -1,20 +1,26 @@
 //! egui HUD: a cockpit-style Feed and Settings.
 
+use std::net::IpAddr;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
+use chrono::{Local, TimeZone, Utc};
+use chrono_tz::Tz;
 use eframe::egui;
-use shield_core::{now_unix, Alert, AlertKind, Config, Connection, CpuSampler};
+use shield_core::{now_unix, Alert, Config, Connection, CpuSampler, Destination};
 
+use crate::monitor::SCAN_INTERVAL;
 use crate::state::{Shared, Tick};
 use crate::theme;
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
     Feed,
+    History,
     Settings,
 }
 
@@ -32,11 +38,13 @@ pub struct ShieldApp {
     store_path: PathBuf,
     really_quit: bool,
     status: String,
-    known: usize,
-    last_scan: u64,
     cpu: CpuSampler,
     core_usage: Vec<f32>,
     last_cpu: u64,
+    records: Vec<(IpAddr, Destination)>,
+    records_at: u64,
+    reset_confirm: bool,
+    last_tick: Instant,
 }
 
 impl ShieldApp {
@@ -58,19 +66,20 @@ impl ShieldApp {
             store_path,
             really_quit: false,
             status: String::from("STARTING"),
-            known: 0,
-            last_scan: 0,
             cpu: CpuSampler::new(),
             core_usage: Vec::new(),
             last_cpu: 0,
+            records: Vec::new(),
+            records_at: 0,
+            reset_confirm: false,
+            last_tick: Instant::now(),
         }
     }
 
     fn drain(&mut self) {
         while let Ok(tick) = self.rx.try_recv() {
             self.conns = tick.conns;
-            self.last_scan = now_unix();
-            self.known = self.shared.store.lock().unwrap().len();
+            self.last_tick = Instant::now();
             if tick.baselined {
                 self.status = "BASELINE SET".to_string();
             } else if tick.alerts.is_empty() {
@@ -82,6 +91,14 @@ impl ShieldApp {
                 self.status = format!("{n} NEW");
             }
         }
+        // Snapshot the first-seen history once per second, newest first.
+        let now = now_unix();
+        if now > self.records_at {
+            let mut records = self.shared.store.lock().unwrap().entries();
+            records.sort_by_key(|r| std::cmp::Reverse(r.1.first_seen));
+            self.records = records;
+            self.records_at = now;
+        }
     }
 
     fn apply_theme(&self, ctx: &egui::Context) {
@@ -91,6 +108,27 @@ impl ShieldApp {
     fn save_config(&self) {
         *self.shared.config.lock().unwrap() = self.config.clone();
         let _ = self.config.save(&self.config_path);
+    }
+
+    /// Where the startup reset sentinel lives (next to the store).
+    fn reset_request_path(&self) -> PathBuf {
+        self.store_path
+            .parent()
+            .map(|p| p.join("reset-requested"))
+            .unwrap_or_else(|| PathBuf::from("reset-requested"))
+    }
+
+    /// Ask the next start to clear + re-baseline. Doing it on restart keeps the
+    /// store single-owner and avoids an alert storm (review A1).
+    fn write_reset_request(&mut self) {
+        let path = self.reset_request_path();
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        match std::fs::write(&path, b"") {
+            Ok(()) => self.status = "RESET SCHEDULED".to_string(),
+            Err(err) => self.status = format!("RESET FAILED: {err}"),
+        }
     }
 
     fn status_color(&self) -> egui::Color32 {
@@ -105,7 +143,7 @@ impl ShieldApp {
 
     fn feed(&mut self, ui: &mut egui::Ui) {
         grid_backdrop(ui);
-        let show_local = self.config.show_local_connections;
+        let show_local = !self.config.quiet_local;
         let mut rows: Vec<&Connection> = self
             .conns
             .iter()
@@ -124,14 +162,6 @@ impl ShieldApp {
             );
         });
         ui.add_space(6.0);
-
-        ui.horizontal(|ui| {
-            gauge(ui, "LINKS", &rows.len().to_string());
-            gauge(ui, "KNOWN", &self.known.to_string());
-            let age = now_unix().saturating_sub(self.last_scan);
-            gauge(ui, "SCAN", &format!("{age}s"));
-        });
-        ui.add_space(4.0);
         hr(ui);
         ui.add_space(6.0);
 
@@ -222,33 +252,66 @@ impl ShieldApp {
             });
     }
 
+    fn history(&mut self, ui: &mut egui::Ui) {
+        grid_backdrop(ui);
+        let tz = self.config.timezone.clone();
+        section(ui, &format!("DESTINATIONS // {}", self.records.len()));
+        ui.add_space(4.0);
+        if self.records.is_empty() {
+            ui.label(
+                egui::RichText::new("// nothing recorded yet")
+                    .color(theme::dim())
+                    .size(small(ui)),
+            );
+            return;
+        }
+        let records = &self.records;
+        egui::ScrollArea::vertical()
+            .id_salt("history")
+            .show(ui, |ui| {
+                egui::Grid::new("history")
+                    .num_columns(5)
+                    .striped(true)
+                    .spacing([18.0, 5.0])
+                    .show(ui, |ui| {
+                        for h in ["WHEN", "WHO", "WHERE", "REVIEWED", "SAFE"] {
+                            ui.label(egui::RichText::new(h).color(theme::dim()).size(small(ui)));
+                        }
+                        ui.end_row();
+                        for (ip, dest) in records {
+                            ui.label(
+                                egui::RichText::new(format_ts(dest.first_seen, &tz))
+                                    .color(theme::text())
+                                    .size(small(ui)),
+                            );
+                            ui.label(
+                                egui::RichText::new(short_exe(Some(&dest.first_exe)))
+                                    .color(theme::cyan()),
+                            );
+                            ui.label(egui::RichText::new(ip.to_string()).color(theme::text()));
+                            flag(ui, dest.reviewed, theme::text());
+                            flag(ui, dest.safe, theme::green());
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
     fn settings(&mut self, ctx: &egui::Context, ui: &mut egui::Ui) {
         grid_backdrop(ui);
         let mut changed = false;
 
         section(ui, "POLICY");
         changed |= ui
-            .checkbox(
-                &mut self.config.alert_on_new_endpoints,
-                "Alert on new destinations for known apps",
-            )
-            .changed();
-        ui.label(
-            egui::RichText::new(
-                "// off by default: a new destination for a trusted app is usually a CDN",
-            )
-            .color(theme::dim())
-            .size(small(ui)),
-        );
-        ui.add_space(6.0);
-        changed |= ui
             .checkbox(&mut self.config.quiet_browsers, "Keep browsers quiet")
+            .on_hover_text("No alerts for browsers, and their destinations are not stored.")
             .changed();
         ui.add_space(6.0);
         changed |= ui
-            .checkbox(
-                &mut self.config.show_local_connections,
-                "Show local (loopback) connections",
+            .checkbox(&mut self.config.quiet_local, "Keep local quiet")
+            .on_hover_text(
+                "Skip loopback (127.0.0.1 / ::1) entirely: no alert, and not stored in the \
+                 directory. Off = treat loopback like any other destination.",
             )
             .changed();
 
@@ -278,6 +341,26 @@ impl ShieldApp {
             .checkbox(&mut self.config.dark_theme, "Dark HUD")
             .changed();
 
+        ui.add_space(12.0);
+        section(ui, "TIME");
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new("Timezone").color(theme::dim()))
+                .on_hover_text(
+                    "IANA timezone used to display times, e.g. Europe/Paris. Times are \
+                     stored in UTC; leave empty to follow the system zone.",
+                );
+            changed |= ui
+                .add(
+                    egui::TextEdit::singleline(&mut self.config.timezone)
+                        .hint_text("system local, e.g. Europe/Paris")
+                        .desired_width(220.0),
+                )
+                .on_hover_text(
+                    "Times are stored in UTC and shown in this zone. Empty = system local.",
+                )
+                .changed();
+        });
+
         if changed {
             self.save_config();
             self.apply_theme(ctx);
@@ -295,6 +378,38 @@ impl ShieldApp {
                 .color(theme::dim())
                 .size(small(ui)),
         );
+
+        ui.add_space(12.0);
+        section(ui, "HISTORY");
+        if !self.reset_confirm {
+            if ui
+                .button("Reset first-seen history…")
+                .on_hover_text(
+                    "Clear the first-seen history (when / who / where) and re-baseline \
+                     current connections on the next start.",
+                )
+                .clicked()
+            {
+                self.reset_confirm = true;
+            }
+        } else {
+            ui.label(
+                egui::RichText::new(
+                    "Clears the list and re-baselines current connections on next start.",
+                )
+                .color(theme::amber())
+                .size(small(ui)),
+            );
+            ui.horizontal(|ui| {
+                if ui.button("Confirm reset").clicked() {
+                    self.write_reset_request();
+                    self.reset_confirm = false;
+                }
+                if ui.button("Cancel").clicked() {
+                    self.reset_confirm = false;
+                }
+            });
+        }
     }
 }
 
@@ -304,6 +419,40 @@ fn small(ui: &egui::Ui) -> f32 {
 
 fn fade(c: egui::Color32, a: u8) -> egui::Color32 {
     egui::Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a)
+}
+
+/// A small yes/no cell for the destination table.
+fn flag(ui: &mut egui::Ui, on: bool, color: egui::Color32) {
+    ui.label(
+        egui::RichText::new(if on { "yes" } else { "no" })
+            .color(if on { color } else { theme::dim() })
+            .size(small(ui)),
+    );
+}
+
+/// Render a stored UTC epoch time in the configured zone. Empty `tz` means the
+/// system local zone; an unknown zone falls back to UTC. 0 means "unknown".
+fn format_ts(ts: u64, tz: &str) -> String {
+    if ts == 0 {
+        return "unknown".to_string();
+    }
+    let Some(utc) = Utc.timestamp_opt(ts as i64, 0).single() else {
+        return "?".to_string();
+    };
+    let name = tz.trim();
+    if name.is_empty() {
+        return utc
+            .with_timezone(&Local)
+            .format("%Y-%m-%d %H:%M:%S")
+            .to_string();
+    }
+    match Tz::from_str(name) {
+        Ok(zone) => utc
+            .with_timezone(&zone)
+            .format("%Y-%m-%d %H:%M:%S %Z")
+            .to_string(),
+        Err(_) => utc.format("%Y-%m-%d %H:%M:%S UTC").to_string(),
+    }
 }
 
 /// One level meter per core: a stack of `CORE_LEVELS` lines, lit from the
@@ -373,29 +522,37 @@ fn section(ui: &mut egui::Ui, title: &str) {
     });
 }
 
-fn gauge(ui: &mut egui::Ui, label: &str, value: &str) {
-    egui::Frame::NONE
-        .fill(theme::panel2())
-        .stroke(egui::Stroke::new(1.0, theme::line()))
-        .corner_radius(egui::CornerRadius::same(2))
-        .inner_margin(egui::Margin::symmetric(14, 6))
-        .show(ui, |ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    egui::RichText::new(label)
-                        .color(theme::dim())
-                        .size(small(ui)),
-                );
-                ui.label(egui::RichText::new(value).color(theme::cyan()).strong());
-            });
-        });
+/// A small ring whose arc fills over one scan cycle and resets. A discrete
+/// liveness signal for the monitor, without a number to parse.
+fn scan_ring(ui: &mut egui::Ui, progress: f32) {
+    let size = 14.0;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(size, size), egui::Sense::hover());
+    let painter = ui.painter();
+    let center = rect.center();
+    let r = size / 2.0 - 1.5;
+    painter.circle_stroke(center, r, egui::Stroke::new(1.5, fade(theme::line(), 160)));
+    let p = progress.clamp(0.0, 1.0);
+    if p <= 0.0 {
+        return;
+    }
+    let start = -std::f32::consts::FRAC_PI_2;
+    let sweep = std::f32::consts::TAU * p;
+    let steps = (24.0 * p).max(2.0) as usize;
+    let pts: Vec<egui::Pos2> = (0..=steps)
+        .map(|i| {
+            let a = start + sweep * (i as f32 / steps as f32);
+            egui::pos2(center.x + r * a.cos(), center.y + r * a.sin())
+        })
+        .collect();
+    painter.add(egui::Shape::line(
+        pts,
+        egui::Stroke::new(1.5, theme::cyan()),
+    ));
 }
 
 fn alert_card(ui: &mut egui::Ui, alert: &Alert) -> bool {
-    let (accent, title) = match alert.kind {
-        AlertKind::NewExecutable => (theme::red(), "NEW EXECUTABLE"),
-        AlertKind::FirstSeenEndpoint => (theme::amber(), "NEW DESTINATION"),
-    };
+    let accent = theme::amber();
+    let title = "NEW DESTINATION";
     let pid = alert
         .pid
         .map(|p| p.to_string())
@@ -543,6 +700,9 @@ impl eframe::App for ShieldApp {
             }
         }
 
+        let scan_progress =
+            (self.last_tick.elapsed().as_secs_f32() / SCAN_INTERVAL.as_secs_f32()).clamp(0.0, 1.0);
+
         egui::Panel::top("header")
             .frame(
                 egui::Frame::NONE
@@ -566,6 +726,12 @@ impl eframe::App for ShieldApp {
                         self.tab = Tab::Feed;
                     }
                     if ui
+                        .selectable_label(self.tab == Tab::History, "HISTORY")
+                        .clicked()
+                    {
+                        self.tab = Tab::History;
+                    }
+                    if ui
                         .selectable_label(self.tab == Tab::Settings, "SETTINGS")
                         .clicked()
                     {
@@ -585,6 +751,8 @@ impl eframe::App for ShieldApp {
                                         .size(small(ui)),
                                 );
                             });
+                        ui.add_space(8.0);
+                        scan_ring(ui, scan_progress);
                     });
                 });
             });
@@ -597,9 +765,11 @@ impl eframe::App for ShieldApp {
             )
             .show(ui, |ui| match self.tab {
                 Tab::Feed => self.feed(ui),
+                Tab::History => self.history(ui),
                 Tab::Settings => self.settings(&ctx, ui),
             });
 
-        ctx.request_repaint_after(Duration::from_millis(500));
+        // Redraw often enough that the header scan ring animates smoothly.
+        ctx.request_repaint_after(Duration::from_millis(100));
     }
 }

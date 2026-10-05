@@ -12,6 +12,7 @@ mod theme;
 mod tray;
 
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::channel;
@@ -19,18 +20,44 @@ use std::sync::Arc;
 
 use eframe::egui;
 use ksni::blocking::TrayMethods;
-use shield_core::{now_unix, scan, Config, FirstSeen};
+use shield_core::{now_unix, scan, Config, Destinations};
 
 use crate::gui::ShieldApp;
 use crate::state::{Shared, Tick};
 use crate::tray::ShieldTray;
 
-fn default_store_path() -> PathBuf {
-    let base = env::var_os("XDG_DATA_HOME")
+fn data_dir() -> PathBuf {
+    env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("shield").join("first-seen.tsv")
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn default_store_path() -> PathBuf {
+    data_dir().join("shield").join("first-seen.tsv")
+}
+
+fn default_reset_path() -> PathBuf {
+    data_dir().join("shield").join("reset-requested")
+}
+
+/// If Settings asked for a reset, clear the baseline and silently re-record
+/// current connections before monitoring starts. Runs once, on the main thread,
+/// while the store has no other owner. The alerts from this scan are dropped on
+/// purpose: the first scan of an emptied store must stay quiet (review A1, A4).
+fn apply_pending_reset(store: &mut Destinations, config: &Config) {
+    let reset_path = default_reset_path();
+    if !reset_path.exists() {
+        return;
+    }
+    match store.clear() {
+        Ok(()) => {
+            let _ = scan(store, now_unix(), config);
+            let _ = fs::remove_file(&reset_path);
+            eprintln!("shield: first-seen history reset and re-baselined");
+        }
+        Err(err) => eprintln!("shield: reset failed: {err}"),
+    }
 }
 
 fn default_config_path() -> PathBuf {
@@ -77,13 +104,14 @@ fn main() {
 
     let config_path = default_config_path();
     let config = Config::open(&config_path).unwrap_or_default();
-    // Normalize the file so newly added keys (e.g. show_local_connections) are
+    // Normalize the file so newly added keys (e.g. timezone) are
     // present even for an existing config.
     let _ = config.save(&config_path);
     let store_path = default_store_path();
 
     if baseline_only {
-        let mut store = FirstSeen::open(&store_path).unwrap_or_else(|_| FirstSeen::in_memory());
+        let mut store =
+            Destinations::open(&store_path).unwrap_or_else(|_| Destinations::in_memory());
         let _ = scan(&mut store, now_unix(), &config);
         println!(
             "shield: baseline recorded ({} known endpoints) at {}",
@@ -93,7 +121,8 @@ fn main() {
         return;
     }
 
-    let store = FirstSeen::open(&store_path).unwrap_or_else(|_| FirstSeen::in_memory());
+    let mut store = Destinations::open(&store_path).unwrap_or_else(|_| Destinations::in_memory());
+    apply_pending_reset(&mut store, &config);
     let shared = Arc::new(Shared::new(store, config.clone()));
     if test_alert {
         shared.test_alert.store(true, Ordering::SeqCst);

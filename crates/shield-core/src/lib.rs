@@ -1,13 +1,14 @@
 //! Shield core: per-process connection attribution from `/proc`, plus the
-//! first-seen baseline that decides what is worth an alert.
+//! destination directory that decides what is worth an alert.
 //!
 //! Userspace only, no privileges beyond reading `/proc` and a local data file.
 //! The store is a dependency-free append-only TSV. This is a deliberate
 //! deviation from the design doc's SQLite: the wedge does not need queries or
 //! retention yet, and the reuse ladder says not to add a dependency for what a
-//! few lines cover. Migrate to SQLite when history/search is actually needed.
+//! few lines cover. Migrate to SQLite when search over a large directory is
+//! actually needed.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -163,25 +164,22 @@ pub fn list_connections() -> Vec<Connection> {
     out
 }
 
-/// A distinct `(executable, remote ip, remote port)` triple.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct EndpointKey {
-    pub exe: String,
-    pub ip: IpAddr,
-    pub port: u16,
+/// A known destination: one remote IP we have seen, with its verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Destination {
+    /// First-seen UTC epoch seconds.
+    pub first_seen: u64,
+    /// The first executable seen contacting it.
+    pub first_exe: String,
+    /// Whether a human has looked at it. (Utopia: false on insert.)
+    pub reviewed: bool,
+    /// Whether it is considered safe. (Utopia: unknown until reviewed.)
+    pub safe: bool,
 }
 
-/// Why an alert fired.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AlertKind {
-    NewExecutable,
-    FirstSeenEndpoint,
-}
-
-/// One thing worth telling the user about.
+/// One thing worth telling the user about: a destination seen for the first time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Alert {
-    pub kind: AlertKind,
     pub pid: Option<i32>,
     pub exe: String,
     pub remote: SocketAddr,
@@ -195,31 +193,26 @@ impl Alert {
             .pid
             .map(|p| p.to_string())
             .unwrap_or_else(|| "-".to_string());
-        let exe = &self.exe;
-        let remote = self.remote;
-        match self.kind {
-            AlertKind::NewExecutable => {
-                format!("new executable {exe} (pid {pid}) connected to {remote}")
-            }
-            AlertKind::FirstSeenEndpoint => {
-                format!("{exe} (pid {pid}) first contacted {remote}")
-            }
-        }
+        format!(
+            "new destination {} - first contacted by {} (pid {pid})",
+            self.remote.ip(),
+            self.exe
+        )
     }
 }
 
-/// First-seen baseline: which executables and endpoints have been observed.
+/// Directory of remote IP destinations Shield has seen.
 ///
-/// Persists as an append-only `exe\tip\tport\tts` file when given a path, or
-/// stays in memory for tests.
+/// Persists as an append-only `ip\tts\treviewed\tsafe\tfirst_exe` file when
+/// given a path, or stays in memory for tests. The legacy
+/// `exe\tip\tport\tts` format is migrated on load.
 #[derive(Debug, Default)]
-pub struct FirstSeen {
+pub struct Destinations {
     path: Option<PathBuf>,
-    exes: HashSet<String>,
-    endpoints: HashSet<EndpointKey>,
+    destinations: HashMap<IpAddr, Destination>,
 }
 
-impl FirstSeen {
+impl Destinations {
     /// An empty, non-persistent store (for tests and dry runs).
     pub fn in_memory() -> Self {
         Self::default()
@@ -236,63 +229,121 @@ impl FirstSeen {
             return Ok(store);
         };
         for line in content.lines() {
-            let mut parts = line.split('\t');
-            let (Some(exe), Some(ip), Some(port)) = (parts.next(), parts.next(), parts.next())
-            else {
-                continue;
-            };
-            let Ok(ip) = ip.parse::<IpAddr>() else {
-                continue;
-            };
-            let Ok(port) = port.parse::<u16>() else {
-                continue;
-            };
-            store.exes.insert(exe.to_string());
-            store.endpoints.insert(EndpointKey {
-                exe: exe.to_string(),
-                ip,
-                port,
-            });
+            let fields: Vec<&str> = line.split('\t').collect();
+            if let Some((ip, dest)) = parse_line(&fields) {
+                store.destinations.entry(ip).or_insert(dest);
+            }
         }
         Ok(store)
     }
 
-    pub fn is_exe_known(&self, exe: &str) -> bool {
-        self.exes.contains(exe)
-    }
-
-    pub fn has_endpoint(&self, key: &EndpointKey) -> bool {
-        self.endpoints.contains(key)
+    pub fn is_known(&self, ip: IpAddr) -> bool {
+        self.destinations.contains_key(&ip)
     }
 
     pub fn len(&self) -> usize {
-        self.endpoints.len()
+        self.destinations.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.endpoints.is_empty()
+        self.destinations.is_empty()
     }
 
-    /// Record an endpoint. Appends to disk only when it is new.
-    pub fn record(&mut self, exe: &str, ip: IpAddr, port: u16, ts: u64) -> io::Result<()> {
-        self.exes.insert(exe.to_string());
-        let key = EndpointKey {
-            exe: exe.to_string(),
-            ip,
-            port,
-        };
-        if !self.endpoints.insert(key) {
-            return Ok(());
+    /// Every destination with its metadata, for display.
+    pub fn entries(&self) -> Vec<(IpAddr, Destination)> {
+        self.destinations
+            .iter()
+            .map(|(ip, dest)| (*ip, dest.clone()))
+            .collect()
+    }
+
+    /// Forget everything and truncate the backing file, if any.
+    ///
+    /// Callers must treat an `Err` as real. Do not swallow it and continue as if
+    /// the history were reset (see the review's A3).
+    pub fn clear(&mut self) -> io::Result<()> {
+        self.destinations.clear();
+        if let Some(path) = &self.path {
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent)?;
+                }
+            }
+            fs::write(path, "")?;
         }
+        Ok(())
+    }
+
+    /// Record a destination. Returns `true` when it was new (and appends to
+    /// disk). A known destination is left untouched, so it is never re-flagged.
+    pub fn record(&mut self, ip: IpAddr, exe: &str, ts: u64) -> io::Result<bool> {
+        if self.destinations.contains_key(&ip) {
+            return Ok(false);
+        }
+        // For now every destination counts as reviewed and safe. The utopia
+        // inserts reviewed = false, safe = false instead, pending a real review.
+        let dest = Destination {
+            first_seen: ts,
+            first_exe: exe.to_string(),
+            reviewed: true,
+            safe: true,
+        };
         if let Some(path) = &self.path {
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)?;
             }
             let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-            writeln!(file, "{exe}\t{ip}\t{port}\t{ts}")?;
+            writeln!(file, "{ip}\t{ts}\t{}\t{}\t{exe}", dest.reviewed, dest.safe)?;
         }
-        Ok(())
+        self.destinations.insert(ip, dest);
+        Ok(true)
     }
+}
+
+/// Parse one store line in either the new `ip\tts\treviewed\tsafe\tfirst_exe`
+/// format or the legacy `exe\tip\tport\tts` format.
+fn parse_line(fields: &[&str]) -> Option<(IpAddr, Destination)> {
+    let truthy = |v: &str| {
+        matches!(
+            v.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "yes" | "on"
+        )
+    };
+    if let Some(ip) = fields.first().and_then(|f| f.parse::<IpAddr>().ok()) {
+        // New format.
+        return Some((
+            ip,
+            Destination {
+                first_seen: fields
+                    .get(1)
+                    .and_then(|t| t.parse::<u64>().ok())
+                    .unwrap_or(0),
+                first_exe: fields.get(4).map(|s| s.to_string()).unwrap_or_default(),
+                reviewed: fields.get(2).map(|v| truthy(v)).unwrap_or(true),
+                safe: fields.get(3).map(|v| truthy(v)).unwrap_or(true),
+            },
+        ));
+    }
+    // Legacy format: exe \t ip \t port \t ts.
+    let first_exe = fields.first().map(|s| s.to_string()).unwrap_or_default();
+    // Browsers are bypassed under the new rule, so an old browser row must not
+    // whitelist the IP it visited.
+    if is_browser_exe(&first_exe) {
+        return None;
+    }
+    let ip = fields.get(1)?.parse::<IpAddr>().ok()?;
+    Some((
+        ip,
+        Destination {
+            first_seen: fields
+                .get(3)
+                .and_then(|t| t.parse::<u64>().ok())
+                .unwrap_or(0),
+            first_exe,
+            reviewed: true,
+            safe: true,
+        },
+    ))
 }
 
 /// Whether an executable looks like a web browser. Browsers churn through CDN
@@ -328,27 +379,27 @@ pub fn is_browser_exe(exe: &str) -> bool {
 /// it. Defaults are chosen to stay calm.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
-    /// Notify on a known executable contacting a first-seen endpoint.
-    pub alert_on_new_endpoints: bool,
-    /// Record but never alert on browsers' endpoint churn.
+    /// Bypass browsers entirely: no alert, no store.
     pub quiet_browsers: bool,
-    /// Show loopback (127.0.0.1/::1) connections in the UI feed. Loopback never
-    /// leaves this machine, so it never alerts; this only affects the feed.
-    pub show_local_connections: bool,
+    /// Hide loopback (127.0.0.1/::1) rows from the UI feed. Loopback never leaves
+    /// this machine, so it never alerts; this only affects the feed. Default true.
+    pub quiet_local: bool,
     /// Base UI font size in px. Clamped to 9..=20. Ctrl +/- in the app.
     pub font_size: u32,
     /// true = dark HUD, false = light.
     pub dark_theme: bool,
+    /// IANA timezone for display, e.g. `Europe/Paris`. Empty means system local.
+    pub timezone: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            alert_on_new_endpoints: false,
             quiet_browsers: true,
-            show_local_connections: false,
+            quiet_local: true,
             font_size: 12,
             dark_theme: true,
+            timezone: String::new(),
         }
     }
 }
@@ -360,6 +411,7 @@ impl Config {
         let Ok(content) = fs::read_to_string(path.as_ref()) else {
             return Ok(config);
         };
+        let mut saw_quiet_local = false;
         for line in content.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -368,18 +420,32 @@ impl Config {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
-            let value = value.trim().to_ascii_lowercase();
-            let on = matches!(value.as_str(), "true" | "1" | "yes" | "on");
+            let raw = value.trim();
+            let on = matches!(
+                raw.to_ascii_lowercase().as_str(),
+                "true" | "1" | "yes" | "on"
+            );
             match key.trim() {
-                "alert_on_new_endpoints" => config.alert_on_new_endpoints = on,
                 "quiet_browsers" => config.quiet_browsers = on,
-                "show_local_connections" => config.show_local_connections = on,
+                "quiet_local" => {
+                    config.quiet_local = on;
+                    saw_quiet_local = true;
+                }
+                // Legacy key: `true` used to mean "show". Migrate to the inverse,
+                // unless an explicit `quiet_local` was already seen.
+                "show_local_connections" => {
+                    if !saw_quiet_local {
+                        config.quiet_local = !on;
+                    }
+                }
                 "font_size" => {
-                    if let Ok(n) = value.parse::<u32>() {
+                    if let Ok(n) = raw.parse::<u32>() {
                         config.font_size = n.clamp(9, 20);
                     }
                 }
                 "dark_theme" => config.dark_theme = on,
+                // Timezone names are case-sensitive; keep the raw value.
+                "timezone" => config.timezone = raw.trim_matches('"').to_string(),
                 _ => {}
             }
         }
@@ -393,33 +459,30 @@ impl Config {
             fs::create_dir_all(parent)?;
         }
         let body = format!(
-            "# shield configuration\nalert_on_new_endpoints = {}\nquiet_browsers = {}\nshow_local_connections = {}\nfont_size = {}\ndark_theme = {}\n",
-            self.alert_on_new_endpoints,
+            "# shield configuration\nquiet_browsers = {}\nquiet_local = {}\nfont_size = {}\ndark_theme = {}\ntimezone = {}\n",
             self.quiet_browsers,
-            self.show_local_connections,
+            self.quiet_local,
             self.font_size,
-            self.dark_theme
+            self.dark_theme,
+            self.timezone
         );
         fs::write(path, body)
     }
 }
 
-/// Classify a snapshot against the baseline.
+/// Classify a snapshot against the destination directory.
 ///
-/// Every non-loopback, owned connection is recorded, so the baseline and the
-/// future feed stay complete. An alert fires when an executable is seen for the
-/// first time (always), or when a known executable contacts a first-seen
-/// endpoint *and* policy allows it (`alert_on_new_endpoints`, except quiet
-/// browsers). A brand-new executable gets one alert; its other endpoints are
-/// recorded silently.
+/// One rule: the first time we see a remote IP, alert and record it. Browsers
+/// (when `quiet_browsers`) and loopback (when `quiet_local`) are bypassed
+/// entirely - neither alerted nor stored - so they cannot whitelist an IP for
+/// anything else.
 pub fn classify(
-    store: &mut FirstSeen,
+    store: &mut Destinations,
     conns: &[Connection],
     now: u64,
     config: &Config,
 ) -> io::Result<Vec<Alert>> {
     let mut alerts = Vec::new();
-    let mut new_this_scan: HashSet<String> = HashSet::new();
     for c in conns {
         if c.inode == 0 {
             continue;
@@ -428,52 +491,26 @@ pub fn classify(
             continue;
         };
         let Some(remote) = c.remote else { continue };
-        if remote.ip().is_loopback() {
-            continue;
-        }
-        let (ip, port) = (remote.ip(), remote.port());
-        let key = EndpointKey {
-            exe: exe.to_string(),
-            ip,
-            port,
-        };
-        let exe_known = store.is_exe_known(exe);
-        let endpoint_known = store.has_endpoint(&key);
-        store.record(exe, ip, port, now)?;
-
-        if !exe_known {
-            alerts.push(Alert {
-                kind: AlertKind::NewExecutable,
-                pid: c.pid,
-                exe: exe.to_string(),
-                remote,
-                first_seen_unix: now,
-            });
-            new_this_scan.insert(exe.to_string());
-            continue;
-        }
-        if new_this_scan.contains(exe) || endpoint_known {
-            continue;
-        }
-        if !config.alert_on_new_endpoints {
+        if config.quiet_local && remote.ip().is_loopback() {
             continue;
         }
         if config.quiet_browsers && is_browser_exe(exe) {
             continue;
         }
-        alerts.push(Alert {
-            kind: AlertKind::FirstSeenEndpoint,
-            pid: c.pid,
-            exe: exe.to_string(),
-            remote,
-            first_seen_unix: now,
-        });
+        if store.record(remote.ip(), exe, now)? {
+            alerts.push(Alert {
+                pid: c.pid,
+                exe: exe.to_string(),
+                remote,
+                first_seen_unix: now,
+            });
+        }
     }
     Ok(alerts)
 }
 
-/// Snapshot the machine and classify it against the baseline.
-pub fn scan(store: &mut FirstSeen, now: u64, config: &Config) -> io::Result<Vec<Alert>> {
+/// Snapshot the machine and classify it against the destination directory.
+pub fn scan(store: &mut Destinations, now: u64, config: &Config) -> io::Result<Vec<Alert>> {
     let conns = list_connections();
     classify(store, &conns, now, config)
 }
@@ -614,16 +651,16 @@ mod tests {
     }
 
     #[test]
-    fn new_executable_alerts_once_then_is_calm() {
-        let mut store = FirstSeen::in_memory();
+    fn new_destination_alerts_once_then_is_calm() {
+        let mut store = Destinations::in_memory();
         let conns = vec![
             conn(100, "/usr/bin/curl", "93.184.216.34", 443, 10),
             conn(100, "/usr/bin/curl", "93.184.216.35", 443, 11),
         ];
         let alerts = classify(&mut store, &conns, 1, &Config::default()).unwrap();
-        assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0].kind, AlertKind::NewExecutable);
-        // Second endpoint of the same new exe is recorded silently.
+        // One alert per new IP.
+        assert_eq!(alerts.len(), 2);
+        assert!(alerts[0].describe().contains("93.184.216.34"));
         assert_eq!(store.len(), 2);
 
         let again = classify(&mut store, &conns, 2, &Config::default()).unwrap();
@@ -631,25 +668,26 @@ mod tests {
     }
 
     #[test]
-    fn known_exe_new_endpoint_alerts() {
-        let mut store = FirstSeen::in_memory();
-        store
-            .record("/usr/bin/curl", "93.184.216.34".parse().unwrap(), 443, 1)
-            .unwrap();
-        let conns = vec![conn(100, "/usr/bin/curl", "93.184.216.35", 443, 10)];
-        let config = Config {
-            alert_on_new_endpoints: true,
-            ..Config::default()
-        };
-        let alerts = classify(&mut store, &conns, 2, &config).unwrap();
-        assert_eq!(alerts.len(), 1);
-        assert_eq!(alerts[0].kind, AlertKind::FirstSeenEndpoint);
-        assert!(alerts[0].describe().contains("93.184.216.35"));
+    fn same_ip_from_two_apps_alerts_once() {
+        let mut store = Destinations::in_memory();
+        let first = vec![conn(1, "/usr/bin/curl", "1.2.3.4", 443, 10)];
+        let second = vec![conn(2, "/usr/bin/wget", "1.2.3.4", 80, 11)];
+        assert_eq!(
+            classify(&mut store, &first, 1, &Config::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        // The IP is known now, so another app reaching it is silent.
+        assert!(classify(&mut store, &second, 2, &Config::default())
+            .unwrap()
+            .is_empty());
+        assert_eq!(store.len(), 1);
     }
 
     #[test]
     fn ignores_loopback_unowned_and_kernel_rows() {
-        let mut store = FirstSeen::in_memory();
+        let mut store = Destinations::in_memory();
         let mut no_pid = conn(0, "/usr/bin/x", "8.8.8.8", 443, 10);
         no_pid.pid = None;
         no_pid.exe = None;
@@ -659,49 +697,32 @@ mod tests {
             conn(100, "/usr/bin/curl", "8.8.8.8", 443, 0),
         ];
         let alerts = classify(&mut store, &conns, 1, &Config::default()).unwrap();
+        // loopback (quiet_local on), a missing exe, and a kernel row are skipped.
         assert!(alerts.is_empty());
         assert!(store.is_empty());
     }
 
     #[test]
-    fn endpoint_alerts_off_by_default_but_still_recorded() {
-        let mut store = FirstSeen::in_memory();
-        store
-            .record("/usr/bin/curl", "1.1.1.1".parse().unwrap(), 443, 1)
-            .unwrap();
-        let conns = vec![conn(1, "/usr/bin/curl", "2.2.2.2", 443, 10)];
-        let alerts = classify(&mut store, &conns, 2, &Config::default()).unwrap();
+    fn browsers_are_bypassed_entirely() {
+        let mut store = Destinations::in_memory();
+        let conns = vec![conn(1, "/usr/lib/firefox/firefox-bin", "2.2.2.2", 443, 10)];
+        let alerts = classify(&mut store, &conns, 1, &Config::default()).unwrap();
         assert!(alerts.is_empty());
-        assert!(store.has_endpoint(&EndpointKey {
-            exe: "/usr/bin/curl".to_string(),
-            ip: "2.2.2.2".parse().unwrap(),
-            port: 443,
-        }));
+        // Not stored, so it cannot whitelist the IP for another app.
+        assert!(store.is_empty());
     }
 
     #[test]
-    fn browsers_stay_quiet_even_when_endpoint_alerts_are_on() {
-        let mut store = FirstSeen::in_memory();
-        store
-            .record(
-                "/usr/lib/firefox/firefox-bin",
-                "1.1.1.1".parse().unwrap(),
-                443,
-                1,
-            )
-            .unwrap();
+    fn loopback_is_alerted_when_quiet_local_is_off() {
+        let mut store = Destinations::in_memory();
+        let conns = vec![conn(1, "/usr/bin/curl", "127.0.0.1", 8080, 10)];
         let config = Config {
-            alert_on_new_endpoints: true,
+            quiet_local: false,
             ..Config::default()
         };
-        let conns = vec![conn(1, "/usr/lib/firefox/firefox-bin", "2.2.2.2", 443, 10)];
-        let alerts = classify(&mut store, &conns, 2, &config).unwrap();
-        assert!(alerts.is_empty());
-        assert!(store.has_endpoint(&EndpointKey {
-            exe: "/usr/lib/firefox/firefox-bin".to_string(),
-            ip: "2.2.2.2".parse().unwrap(),
-            port: 443,
-        }));
+        let alerts = classify(&mut store, &conns, 1, &config).unwrap();
+        assert_eq!(alerts.len(), 1);
+        assert!(store.is_known("127.0.0.1".parse().unwrap()));
     }
 
     #[test]
@@ -710,11 +731,11 @@ mod tests {
         let path = dir.join("config.toml");
         let _ = fs::remove_file(&path);
         let config = Config {
-            alert_on_new_endpoints: true,
             quiet_browsers: false,
-            show_local_connections: true,
+            quiet_local: false,
             font_size: 15,
             dark_theme: false,
+            timezone: "Europe/Paris".to_string(),
         };
         config.save(&path).unwrap();
         assert_eq!(Config::open(&path).unwrap(), config);
@@ -723,15 +744,49 @@ mod tests {
     }
 
     #[test]
-    fn config_defaults_show_local_off_and_parses_it() {
+    fn quiet_local_defaults_true_and_parses() {
         let dir = std::env::temp_dir().join(format!("shield-cfg2-{}", std::process::id()));
         let path = dir.join("config.toml");
+        let _ = fs::create_dir_all(&dir);
+        assert!(Config::default().quiet_local);
+        fs::write(&path, "quiet_local = false\n").unwrap();
+        assert!(!Config::open(&path).unwrap().quiet_local);
         let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn legacy_show_local_migrates_inverted() {
+        let dir = std::env::temp_dir().join(format!("shield-cfg-legacy-{}", std::process::id()));
+        let path = dir.join("config.toml");
         let _ = fs::create_dir_all(&dir);
         fs::write(&path, "show_local_connections = true\n").unwrap();
-        assert!(Config::open(&path).unwrap().show_local_connections);
-        fs::write(&path, "quiet_browsers = true\n").unwrap();
-        assert!(!Config::open(&path).unwrap().show_local_connections);
+        assert!(!Config::open(&path).unwrap().quiet_local);
+        fs::write(&path, "show_local_connections = false\n").unwrap();
+        assert!(Config::open(&path).unwrap().quiet_local);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn explicit_quiet_local_wins_over_legacy() {
+        let dir = std::env::temp_dir().join(format!("shield-cfg-both-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = fs::create_dir_all(&dir);
+        // legacy first, explicit after
+        fs::write(
+            &path,
+            "show_local_connections = false\nquiet_local = false\n",
+        )
+        .unwrap();
+        assert!(!Config::open(&path).unwrap().quiet_local);
+        // explicit first, legacy after
+        fs::write(
+            &path,
+            "quiet_local = false\nshow_local_connections = true\n",
+        )
+        .unwrap();
+        assert!(!Config::open(&path).unwrap().quiet_local);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
     }
@@ -752,23 +807,110 @@ mod tests {
     #[test]
     fn store_round_trips_through_disk() {
         let dir = std::env::temp_dir().join(format!("shield-test-{}", std::process::id()));
-        let path = dir.join("first-seen.tsv");
+        let path = dir.join("destinations.tsv");
         let _ = fs::remove_file(&path);
 
-        let mut store = FirstSeen::open(&path).unwrap();
+        let mut store = Destinations::open(&path).unwrap();
         assert!(store.is_empty());
-        store
-            .record("/usr/bin/curl", "93.184.216.34".parse().unwrap(), 443, 1)
-            .unwrap();
+        assert!(store
+            .record("93.184.216.34".parse().unwrap(), "/usr/bin/curl", 1)
+            .unwrap());
 
-        let reloaded = FirstSeen::open(&path).unwrap();
-        assert!(reloaded.is_exe_known("/usr/bin/curl"));
-        assert!(reloaded.has_endpoint(&EndpointKey {
-            exe: "/usr/bin/curl".to_string(),
-            ip: "93.184.216.34".parse().unwrap(),
-            port: 443,
-        }));
+        let reloaded = Destinations::open(&path).unwrap();
+        let entries = reloaded.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "93.184.216.34".parse::<IpAddr>().unwrap());
+        assert_eq!(entries[0].1.first_seen, 1);
+        assert_eq!(entries[0].1.first_exe, "/usr/bin/curl");
+        assert!(entries[0].1.reviewed && entries[0].1.safe);
 
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn open_reads_new_and_legacy_formats() {
+        let dir = std::env::temp_dir().join(format!("shield-ts-{}", std::process::id()));
+        let path = dir.join("destinations.tsv");
+        let _ = fs::create_dir_all(&dir);
+        fs::write(
+            &path,
+            // new: ip \t ts \t reviewed \t safe \t first_exe
+            "1.1.1.1\t1700000000\ttrue\ttrue\t/usr/bin/a\n\
+             /usr/bin/b\t2.2.2.2\t80\t1700000001\n\
+             /usr/lib/firefox/firefox-bin\t3.3.3.3\t443\t1700000002\n",
+        )
+        .unwrap();
+        let store = Destinations::open(&path).unwrap();
+        assert_eq!(store.len(), 2);
+        // A legacy browser row is dropped, not allowed to whitelist its IP.
+        assert!(!store.is_known("3.3.3.3".parse().unwrap()));
+        let entries = store.entries();
+        let by_ip = |ip: &str| {
+            entries
+                .iter()
+                .find(|(k, _)| *k == ip.parse::<IpAddr>().unwrap())
+                .unwrap()
+                .1
+                .clone()
+        };
+        let d1 = by_ip("1.1.1.1");
+        assert_eq!(d1.first_seen, 1_700_000_000);
+        assert_eq!(d1.first_exe, "/usr/bin/a");
+        // Legacy line migrates to the IP, reviewed and safe.
+        let d2 = by_ip("2.2.2.2");
+        assert_eq!(d2.first_seen, 1_700_000_001);
+        assert_eq!(d2.first_exe, "/usr/bin/b");
+        assert!(d2.reviewed && d2.safe);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn clear_empties_memory_and_truncates_file() {
+        let dir = std::env::temp_dir().join(format!("shield-clear-{}", std::process::id()));
+        let path = dir.join("destinations.tsv");
+        let _ = fs::create_dir_all(&dir);
+        let mut store = Destinations::open(&path).unwrap();
+        assert!(store
+            .record("1.1.1.1".parse().unwrap(), "/usr/bin/a", 5)
+            .unwrap());
+        assert_eq!(store.len(), 1);
+        store.clear().unwrap();
+        assert!(store.is_empty());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "");
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn duplicate_record_does_not_append_or_change_time() {
+        let dir = std::env::temp_dir().join(format!("shield-dup-{}", std::process::id()));
+        let path = dir.join("destinations.tsv");
+        let _ = fs::create_dir_all(&dir);
+        let mut store = Destinations::open(&path).unwrap();
+        assert!(store
+            .record("1.1.1.1".parse().unwrap(), "/usr/bin/a", 5)
+            .unwrap());
+        assert!(!store
+            .record("1.1.1.1".parse().unwrap(), "/usr/bin/b", 99)
+            .unwrap());
+        assert_eq!(store.len(), 1);
+        let entries = store.entries();
+        assert_eq!(entries[0].1.first_seen, 5);
+        assert_eq!(entries[0].1.first_exe, "/usr/bin/a");
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 1);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn config_parses_timezone_without_lowercasing() {
+        let dir = std::env::temp_dir().join(format!("shield-tz-{}", std::process::id()));
+        let path = dir.join("config.toml");
+        let _ = fs::create_dir_all(&dir);
+        fs::write(&path, "timezone = Europe/Paris\n").unwrap();
+        assert_eq!(Config::open(&path).unwrap().timezone, "Europe/Paris");
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
     }

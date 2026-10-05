@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use shield_core::{classify, list_connections, now_unix, Alert, AlertKind};
+use shield_core::{classify, list_connections, now_unix, Alert};
 
 use crate::state::{Shared, Tick};
 
@@ -28,7 +28,6 @@ pub fn spawn(shared: Arc<Shared>, tx: Sender<Tick>) {
         };
         if shared.test_alert.swap(false, Ordering::SeqCst) {
             alerts.push(Alert {
-                kind: AlertKind::NewExecutable,
                 pid: Some(std::process::id() as i32),
                 exe: "shield-self-test".to_string(),
                 remote: "203.0.113.9:443".parse().unwrap(),

@@ -13,3 +13,5 @@ eframe = "0.36.2"
 ksni = { version = "0.3.6", default-features = false, features = ["blocking", "async-io"] }
 notify-rust = "4.18.1"
 shield-core = { path = "../shield-core" }
+chrono = "0.4"
+chrono-tz = "0.10"

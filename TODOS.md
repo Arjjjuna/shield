@@ -1,7 +1,7 @@
 # Shield — TODOS
 
 Derived from the `plan-eng-review` of
-`docs/design/shield-design-2026-10-04.md` (2026-10-04). Ordered by priority;
+`docs/design/2026-10-04-shield-design.md` (2026-10-04). Ordered by priority;
 check items off as they land. Each item names the finding it resolves and the
 files it touches. Effort is human-team / agent time.
 

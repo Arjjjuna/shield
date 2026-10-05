@@ -2,8 +2,8 @@
 
 Shield is a calm, local network sentinel: it watches what this machine connects
 to, attributes each connection to a process, and alerts only on things worth a
-look. See `docs/design/shield-design-2026-10-04.md` for the design and
-`TODOS.md` for open work.
+look. See `docs/architecture.md` for how the system works now, `docs/design/`
+for the dated decision records, and `TODOS.md` for open work.
 
 ## Commands
 
