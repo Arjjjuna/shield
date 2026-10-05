@@ -6,7 +6,26 @@ The system **as it is now**. Dated decision records live under `docs/design/`
 ## Purpose
 
 A local network sentinel: watch outbound TCP connections, attribute each to a
-process, and alert the first time it sees a new **destination** (a remote IP).
+process, and surface the first time it sees a new **destination** (a remote IP).
+
+## Philosophy
+
+**Exhaustive, not calm.** The point is to see *every* destination the machine
+talks to and have a human judge it. The failure that matters is a **missed
+threat** (a false negative) — not having too many alerts.
+
+That is a hard target, so the app is built to grow toward it: we start with
+knowingly accepted weaknesses to get the overall structure in place, and close
+them one at a time, little by little. The current accepted gaps, each to be
+removed:
+
+- A new destination is stored `reviewed = true, safe = true`, so it goes quiet
+  after its first sighting. The target is `reviewed = false, safe = false` until
+  a human (or a trusted list) actually clears it.
+- No reputation / safe-list lookup yet: the directory is a local log, not a
+  verified verdict.
+- Attribution sees only this user's `/proc`; root and other users are invisible.
+- Destinations are IP-only; ports are ignored.
 
 ## Alerting
 
@@ -17,10 +36,10 @@ is no app-level trust; the destination is the unit.
 - `quiet_browsers` bypasses browsers entirely — no alert and **not stored**.
 - `quiet_local` bypasses loopback the same way (default on).
 
-Each stored destination carries `reviewed` and `safe` flags (see the utopia).
-For now every destination is inserted `reviewed = true, safe = true`, i.e. quiet
-after its first connection. Consequence: one sighting silences an IP for every
-app, until the review flow below lands.
+Each stored destination carries `reviewed` and `safe` flags. For now every
+destination is inserted `reviewed = true, safe = true` (quiet after its first
+sighting) — a knowingly accepted gap while the structure is built; see
+**Philosophy**.
 
 ## Module map
 
@@ -112,3 +131,5 @@ about 10 times a second so it animates smoothly.
   one rule — alert on a new destination IP; removed the app-trust model, the
   new-executable alert, and `alert_on_new_endpoints`; the store is now an
   IP-keyed directory with `reviewed`/`safe` flags.
+- 2026-10-05 — objective written down: **exhaustive, not calm**, with the
+  currently accepted gaps listed (see Philosophy); closing them is the roadmap.
