@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use shield_core::{classify, list_connections, now_unix, Alert, Config, Connection, Destinations};
+use shield_core::{classify, now_unix, snapshot, Alert, Config, Connection, Destinations};
 
 use crate::state::{Shared, Tick};
 
@@ -42,7 +42,8 @@ pub fn spawn(shared: Arc<Shared>, tx: Sender<Tick>) {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let conns = list_connections();
+        let snap = snapshot();
+        let conns = snap.connections;
         let (mut alerts, error) = {
             let mut store = shared.store.lock().unwrap_or_else(|e| e.into_inner());
             classify_reporting(&mut store, &conns, now_unix(), &config)
@@ -70,6 +71,7 @@ pub fn spawn(shared: Arc<Shared>, tx: Sender<Tick>) {
             conns,
             alerts: if baselined { Vec::new() } else { alerts },
             baselined,
+            procs: snap.processes,
             error,
         });
 

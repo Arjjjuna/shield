@@ -44,9 +44,11 @@ sighting) — a knowingly accepted gap while the structure is built; see
 ## Module map
 
 - `crates/shield-core` — no dependencies.
-  - `/proc` parsing: `parse_proc_net`, `parse_addr`, `inode_owner_map`,
-    `list_connections`.
-  - Baseline: `FirstSeen` (first-seen store), `EndpointKey`.
+  - `/proc` parsing: `parse_proc_net`, `parse_addr`, `scan_proc` (one walk),
+    `list_connections_with`, `snapshot`, `list_connections`, `list_processes`.
+  - Processes: `Process` (per-pid) and `AppRow` + `group_processes` (collapse to
+    one row per executable, for the PROCESSES tab and the future trust pane).
+  - Store: `Destinations` (the destination directory).
   - Policy: `Config`, `classify`, `is_browser_exe`.
   - Metrics: `CpuSampler` (per-core load from `/proc/stat`).
 - `crates/shield-app` — binary `shield`.
@@ -60,10 +62,11 @@ sighting) — a knowingly accepted gap while the structure is built; see
 
 ## Data flow
 
-Monitor thread, every 5 s: `list_connections()` → `classify(store, conns, now,
-config)` records new endpoints in `FirstSeen` (appending to the TSV) and returns
-alerts → desktop notification + tray badge → sends `Tick { conns, alerts,
-baselined }` to the GUI.
+Monitor thread, every 5 s: `snapshot()` walks `/proc` **once**, yielding the
+connections and every readable process of this user → `classify(store, conns,
+now, config)` records new destinations (appending to the TSV) and returns alerts
+→ desktop notification + tray badge → sends `Tick { conns, procs, alerts,
+baselined, error }` to the GUI.
 
 GUI thread: `drain()` consumes ticks and updates FEED (core meters, gauges,
 alert cards, live links); HISTORY is refreshed once per second; the CPU meters
@@ -109,11 +112,14 @@ load.
 
 ## UI
 
-egui HUD with a header (status badge + a small **scan-cycle ring**) and three
+egui HUD with a header (status badge + a small **scan-cycle ring**) and four
 tabs. **FEED**: core level meters + separator, alert cards, and live links
 grouped by app (the current count is the `LINKS // N` heading). **HISTORY** /
 **DESTINATIONS**: grid of WHEN / WHO / WHERE / REVIEWED / SAFE, newest first.
-**SETTINGS**: policy, display / font size, time / timezone, paths, and Reset.
+**PROCESSES**: every running executable of this user, one row per path, with
+APP / PATH / PIDS (count, pids on hover) / LINKS (current external
+connections); read-only and live from the scan. **SETTINGS**: policy,
+display / font size, time / timezone, paths, and Reset.
 Shortcuts: Ctrl +/- font, Ctrl 0 reset font, Ctrl T test alert. The
 header ring fills over one `SCAN_INTERVAL` (5 s) and resets; the window repaints
 about 10 times a second so it animates smoothly.
@@ -156,3 +162,7 @@ about 10 times a second so it animates smoothly.
 - 2026-10-06 — monitor failure visibility (TODOS P1-1; review A2/Q1): store and
   scan errors, monitor death/stall, and an unopenable store now surface in the UI
   instead of showing `CALM`.
+- 2026-10-06 — [trusted apps, phase 1](2026-10-06-trusted-apps-design.md): a
+  PROCESSES tab (every running executable of this user, grouped by path) and one
+  `/proc` snapshot per scan shared by connections and processes. No store change
+  yet; trust is phase 2.

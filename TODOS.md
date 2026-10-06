@@ -43,6 +43,9 @@ audit).
   be replaced by a different binary. Hash a new executable once (cache by
   device+inode); alert on hash change. File: `crates/shield-core/src/lib.rs`.
   Effort: ~0.5 day / ~20 min. Depends on the hash open question below.
+  **Also a trust-integrity prerequisite** (see
+  `docs/design/2026-10-06-trusted-apps-design.md`): until it lands, a trusted
+  path stays trusted if its binary is replaced.
 
 ## P3 — Polish
 

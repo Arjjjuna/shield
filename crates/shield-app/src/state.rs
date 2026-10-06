@@ -3,7 +3,7 @@
 use std::sync::atomic::AtomicBool;
 use std::sync::Mutex;
 
-use shield_core::{Alert, Config, Connection, Destinations};
+use shield_core::{Alert, Config, Connection, Destinations, Process};
 
 /// State shared across threads. Everything is small and lock held briefly.
 pub struct Shared {
@@ -36,6 +36,8 @@ pub struct Tick {
     pub conns: Vec<Connection>,
     pub alerts: Vec<Alert>,
     pub baselined: bool,
+    /// Every running process of this user, from the same `/proc` snapshot.
+    pub procs: Vec<Process>,
     /// Set when this cycle could not record to the store. Never swallowed: an
     /// unwritable store must read as an error, not as "calm" (review A2/Q1).
     pub error: Option<String>,

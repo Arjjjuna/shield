@@ -11,7 +11,9 @@ use std::time::{Duration, Instant};
 use chrono::{Local, TimeZone, Utc};
 use chrono_tz::Tz;
 use eframe::egui;
-use shield_core::{now_unix, Alert, Config, Connection, CpuSampler, Destination};
+use shield_core::{
+    group_processes, now_unix, Alert, AppRow, Config, Connection, CpuSampler, Destination,
+};
 
 use crate::monitor::SCAN_INTERVAL;
 use crate::state::{Shared, Tick};
@@ -21,6 +23,7 @@ use crate::theme;
 enum Tab {
     Feed,
     History,
+    Processes,
     Settings,
 }
 
@@ -33,6 +36,8 @@ pub struct ShieldApp {
     tab: Tab,
     conns: Vec<Connection>,
     alerts: Vec<Alert>,
+    /// Processes collapsed to one row per executable, rebuilt each tick.
+    apps: Vec<AppRow>,
     config: Config,
     config_path: PathBuf,
     store_path: PathBuf,
@@ -69,6 +74,7 @@ impl ShieldApp {
             tab: Tab::Feed,
             conns: Vec::new(),
             alerts: Vec::new(),
+            apps: Vec::new(),
             config,
             config_path,
             store_path,
@@ -91,6 +97,7 @@ impl ShieldApp {
         loop {
             match self.rx.try_recv() {
                 Ok(tick) => {
+                    self.apps = group_processes(&tick.procs);
                     self.conns = tick.conns;
                     self.last_tick = Instant::now();
                     self.last_error = tick.error;
@@ -370,6 +377,63 @@ impl ShieldApp {
                             ui.label(egui::RichText::new(ip.to_string()).color(theme::text()));
                             flag(ui, dest.reviewed, theme::text());
                             flag(ui, dest.safe, theme::green());
+                            ui.end_row();
+                        }
+                    });
+            });
+    }
+
+    fn processes(&mut self, ui: &mut egui::Ui) {
+        grid_backdrop(ui);
+        section(ui, &format!("PROCESSES // {}", self.apps.len()));
+        ui.add_space(4.0);
+        if self.apps.is_empty() {
+            ui.label(
+                egui::RichText::new("// no processes visible")
+                    .color(theme::dim())
+                    .size(small(ui)),
+            );
+            return;
+        }
+        let apps = &self.apps;
+        egui::ScrollArea::vertical()
+            .id_salt("processes")
+            .show(ui, |ui| {
+                egui::Grid::new("processes")
+                    .num_columns(4)
+                    .striped(true)
+                    .spacing([18.0, 5.0])
+                    .show(ui, |ui| {
+                        for h in ["APP", "PATH", "PIDS", "LINKS"] {
+                            ui.label(egui::RichText::new(h).color(theme::dim()).size(small(ui)));
+                        }
+                        ui.end_row();
+                        for row in apps {
+                            ui.label(
+                                egui::RichText::new(short_exe(Some(&row.exe))).color(theme::cyan()),
+                            );
+                            ui.label(
+                                egui::RichText::new(&row.exe)
+                                    .color(theme::text())
+                                    .size(small(ui)),
+                            );
+                            let pids = row
+                                .pids
+                                .iter()
+                                .map(|p| p.to_string())
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            ui.label(
+                                egui::RichText::new(row.pids.len().to_string())
+                                    .color(theme::text()),
+                            )
+                            .on_hover_text(format!("pids: {pids}"));
+                            let color = if row.connections > 0 {
+                                theme::amber()
+                            } else {
+                                theme::dim()
+                            };
+                            ui.label(egui::RichText::new(row.connections.to_string()).color(color));
                             ui.end_row();
                         }
                     });
@@ -812,6 +876,12 @@ impl eframe::App for ShieldApp {
                         self.tab = Tab::History;
                     }
                     if ui
+                        .selectable_label(self.tab == Tab::Processes, "PROCESSES")
+                        .clicked()
+                    {
+                        self.tab = Tab::Processes;
+                    }
+                    if ui
                         .selectable_label(self.tab == Tab::Settings, "SETTINGS")
                         .clicked()
                     {
@@ -866,6 +936,7 @@ impl eframe::App for ShieldApp {
             .show(ui, |ui| match self.tab {
                 Tab::Feed => self.feed(ui),
                 Tab::History => self.history(ui),
+                Tab::Processes => self.processes(ui),
                 Tab::Settings => self.settings(&ctx, ui),
             });
 
@@ -901,6 +972,7 @@ mod tests {
             conns: Vec::new(),
             alerts: Vec::new(),
             baselined: false,
+            procs: Vec::new(),
             error: error.map(str::to_string),
         }
     }

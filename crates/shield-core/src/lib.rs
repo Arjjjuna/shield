@@ -97,17 +97,89 @@ fn parse_proc_net(content: &str) -> Vec<RawConn> {
     out
 }
 
-/// Build inode -> (pid, exe) by scanning `/proc/<pid>/fd` symlinks.
-fn inode_owner_map() -> std::collections::HashMap<u64, (i32, Option<String>)> {
-    let mut map = std::collections::HashMap::new();
+/// One running process visible to this user.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Process {
+    pub pid: i32,
+    /// Resolved `/proc/<pid>/exe` path. Only processes whose executable we can
+    /// read appear at all; kernel threads have no exe and are never listed.
+    pub exe: String,
+    /// Number of external (remote) TCP connections it currently holds.
+    pub connections: usize,
+}
+
+/// One executable's processes collapsed to a single row (for the processes tab
+/// and, later, the trusted-app list).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppRow {
+    pub exe: String,
+    pub pids: Vec<i32>,
+    pub connections: usize,
+}
+
+/// Collapse a per-pid process list into one row per executable, sorted by
+/// executable path, with pids sorted ascending.
+pub fn group_processes(procs: &[Process]) -> Vec<AppRow> {
+    let mut by_exe: HashMap<String, AppRow> = HashMap::new();
+    for p in procs {
+        let row = by_exe.entry(p.exe.clone()).or_insert_with(|| AppRow {
+            exe: p.exe.clone(),
+            pids: Vec::new(),
+            connections: 0,
+        });
+        row.pids.push(p.pid);
+        row.connections += p.connections;
+    }
+    let mut rows: Vec<AppRow> = by_exe.into_values().collect();
+    for row in &mut rows {
+        row.pids.sort_unstable();
+    }
+    rows.sort_by(|a, b| a.exe.cmp(&b.exe));
+    rows
+}
+
+/// Attach per-pid connection counts to raw `(pid, exe)` pairs, sorted by
+/// `(exe, pid)` for a stable list.
+fn build_processes(
+    pairs: Vec<(i32, String)>,
+    connections_by_pid: &HashMap<i32, usize>,
+) -> Vec<Process> {
+    let mut procs: Vec<Process> = pairs
+        .into_iter()
+        .map(|(pid, exe)| Process {
+            pid,
+            exe,
+            connections: connections_by_pid.get(&pid).copied().unwrap_or(0),
+        })
+        .collect();
+    procs.sort_by(|a, b| a.exe.cmp(&b.exe).then(a.pid.cmp(&b.pid)));
+    procs
+}
+
+/// inode -> (pid, exe) attribution for the socket fds we could reach.
+type OwnedInode = HashMap<u64, (i32, Option<String>)>;
+
+/// Walk `/proc` once: map socket inodes to their owning pid+exe, and collect
+/// every process whose executable we can read. Returns `(owners, process
+/// pairs)`; `owners` maps inode -> (pid, exe).
+fn scan_proc() -> (OwnedInode, Vec<(i32, String)>) {
+    let mut owners: OwnedInode = HashMap::new();
+    let mut procs: Vec<(i32, String)> = Vec::new();
     let Ok(entries) = fs::read_dir("/proc") else {
-        return map;
+        return (owners, procs);
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
         let Some(pid) = name.to_str().and_then(|s| s.parse::<i32>().ok()) else {
             continue;
         };
+        // Read the executable once per process, not once per socket fd.
+        let exe = fs::read_link(entry.path().join("exe"))
+            .ok()
+            .map(|p| p.display().to_string());
+        if let Some(exe) = &exe {
+            procs.push((pid, exe.clone()));
+        }
         let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
             continue;
         };
@@ -125,19 +197,14 @@ fn inode_owner_map() -> std::collections::HashMap<u64, (i32, Option<String>)> {
             let Ok(inode) = inode_str.parse::<u64>() else {
                 continue;
             };
-            let exe = fs::read_link(entry.path().join("exe"))
-                .ok()
-                .map(|p| p.display().to_string());
-            map.insert(inode, (pid, exe));
+            owners.insert(inode, (pid, exe.clone()));
         }
     }
-    map
+    (owners, procs)
 }
 
-/// Snapshot every TCP connection currently visible to this user, attributed to
-/// its owning process where the socket is reachable via `/proc`.
-pub fn list_connections() -> Vec<Connection> {
-    let owners = inode_owner_map();
+/// Attribute the `/proc/net/tcp[6]` rows using a prepared inode -> owner map.
+fn list_connections_with(owners: &OwnedInode) -> Vec<Connection> {
     let mut out = Vec::new();
     for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
         let Ok(content) = fs::read_to_string(path) else {
@@ -162,6 +229,47 @@ pub fn list_connections() -> Vec<Connection> {
         }
     }
     out
+}
+
+/// Everything one `/proc` traversal yields, so the monitor walks `/proc` once
+/// per cycle instead of once for connections and again for processes.
+#[derive(Debug, Clone, Default)]
+pub struct Snapshot {
+    pub connections: Vec<Connection>,
+    pub processes: Vec<Process>,
+}
+
+/// Count external (non-loopback) connections per pid.
+fn count_connections_by_pid(conns: &[Connection]) -> HashMap<i32, usize> {
+    let mut counts: HashMap<i32, usize> = HashMap::new();
+    for c in conns {
+        if let Some(pid) = c.pid {
+            // Loopback never leaves the machine; it is not an external link.
+            if c.remote.is_some_and(|r| r.ip().is_loopback()) {
+                continue;
+            }
+            *counts.entry(pid).or_default() += 1;
+        }
+    }
+    counts
+}
+
+/// Snapshot every TCP connection and every readable process of this user.
+pub fn snapshot() -> Snapshot {
+    let (owners, pairs) = scan_proc();
+    let connections = list_connections_with(&owners);
+    let connections_by_pid = count_connections_by_pid(&connections);
+    let processes = build_processes(pairs, &connections_by_pid);
+    Snapshot {
+        connections,
+        processes,
+    }
+}
+
+/// Snapshot every TCP connection currently visible to this user, attributed to
+/// its owning process where the socket is reachable via `/proc`.
+pub fn list_connections() -> Vec<Connection> {
+    list_connections_with(&scan_proc().0)
 }
 
 /// A known destination: one remote IP we have seen, with its verdict.
@@ -885,6 +993,60 @@ mod tests {
         let path = blocker.join("destinations.tsv");
         assert!(Destinations::open(&path).is_err());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn group_processes_collapses_by_executable() {
+        let procs = vec![
+            Process {
+                pid: 30,
+                exe: "/usr/bin/b".into(),
+                connections: 1,
+            },
+            Process {
+                pid: 10,
+                exe: "/usr/bin/a".into(),
+                connections: 2,
+            },
+            Process {
+                pid: 11,
+                exe: "/usr/bin/a".into(),
+                connections: 3,
+            },
+        ];
+        let rows = group_processes(&procs);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].exe, "/usr/bin/a");
+        assert_eq!(rows[0].pids, vec![10, 11]);
+        assert_eq!(rows[0].connections, 5);
+        assert_eq!(rows[1].exe, "/usr/bin/b");
+        assert_eq!(rows[1].connections, 1);
+    }
+
+    #[test]
+    fn build_processes_attaches_connection_counts() {
+        let pairs = vec![(2, "/b".to_string()), (1, "/a".to_string())];
+        let mut counts = HashMap::new();
+        counts.insert(1, 4usize);
+        let procs = build_processes(pairs, &counts);
+        assert_eq!(procs.len(), 2);
+        // Sorted by exe, so /a comes first.
+        assert_eq!(procs[0].exe, "/a");
+        assert_eq!(procs[0].connections, 4);
+        assert_eq!(procs[1].exe, "/b");
+        assert_eq!(procs[1].connections, 0);
+    }
+
+    #[test]
+    fn count_connections_by_pid_skips_loopback_and_unowned() {
+        let c1 = conn(1, "/usr/bin/a", "1.2.3.4", 443, 10);
+        let c2 = conn(1, "/usr/bin/a", "127.0.0.1", 8080, 11);
+        let mut c3 = conn(9, "/usr/bin/b", "5.6.7.8", 443, 12);
+        c3.pid = None;
+        let counts = count_connections_by_pid(&[c1, c2, c3]);
+        // The loopback link and the unattributed row are not counted.
+        assert_eq!(counts.get(&1).copied(), Some(1));
+        assert_eq!(counts.get(&9), None);
     }
 
     #[test]
