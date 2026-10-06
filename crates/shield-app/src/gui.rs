@@ -291,14 +291,7 @@ impl ShieldApp {
         hr(ui);
         ui.add_space(6.0);
 
-        ui.horizontal(|ui| {
-            section(ui, "ALERTS");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui.button("TEST ALERT").clicked() {
-                    self.shared.test_alert.store(true, Ordering::SeqCst);
-                }
-            });
-        });
+        section(ui, "ALERTS");
         if self.alerts.is_empty() {
             ui.label(
                 egui::RichText::new("// no anomalies")
