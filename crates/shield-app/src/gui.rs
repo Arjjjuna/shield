@@ -1,5 +1,6 @@
 //! egui HUD: a cockpit-style Feed and Settings.
 
+use std::collections::HashSet;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
@@ -12,7 +13,8 @@ use chrono::{Local, TimeZone, Utc};
 use chrono_tz::Tz;
 use eframe::egui;
 use shield_core::{
-    group_processes, now_unix, Alert, AppRow, Config, Connection, CpuSampler, Destination,
+    group_connections, group_processes, now_unix, Alert, AppRow, Config, Connection, CpuSampler,
+    Destination, TrustedApp,
 };
 
 use crate::monitor::SCAN_INTERVAL;
@@ -38,6 +40,8 @@ pub struct ShieldApp {
     alerts: Vec<Alert>,
     /// Processes collapsed to one row per executable, rebuilt each tick.
     apps: Vec<AppRow>,
+    /// Apps with an external connection, rebuilt each tick (feed right pane).
+    feed_apps: Vec<AppRow>,
     config: Config,
     config_path: PathBuf,
     store_path: PathBuf,
@@ -53,7 +57,9 @@ pub struct ShieldApp {
     cpu: CpuSampler,
     core_usage: Vec<f32>,
     last_cpu: u64,
-    records: Vec<(IpAddr, Destination)>,
+    records: Vec<(String, IpAddr, Destination)>,
+    /// Trusted apps, refreshed once per second (for green and the trust list).
+    trusted: Vec<(String, TrustedApp)>,
     records_at: u64,
     reset_confirm: bool,
     last_tick: Instant,
@@ -75,6 +81,7 @@ impl ShieldApp {
             conns: Vec::new(),
             alerts: Vec::new(),
             apps: Vec::new(),
+            feed_apps: Vec::new(),
             config,
             config_path,
             store_path,
@@ -87,6 +94,7 @@ impl ShieldApp {
             core_usage: Vec::new(),
             last_cpu: 0,
             records: Vec::new(),
+            trusted: Vec::new(),
             records_at: 0,
             reset_confirm: false,
             last_tick: Instant::now(),
@@ -99,6 +107,7 @@ impl ShieldApp {
                 Ok(tick) => {
                     self.apps = group_processes(&tick.procs);
                     self.conns = tick.conns;
+                    self.feed_apps = group_connections(&self.conns);
                     self.last_tick = Instant::now();
                     self.last_error = tick.error;
                     if tick.baselined {
@@ -126,14 +135,20 @@ impl ShieldApp {
         // Snapshot the first-seen history once per second, newest first.
         let now = now_unix();
         if now > self.records_at {
-            let mut records = self
+            // Lock the two stores separately: nesting would risk deadlock with
+            // the monitor, which holds them trusted -> store.
+            let mut records = {
+                let store = self.shared.store.lock().unwrap_or_else(|e| e.into_inner());
+                store.entries()
+            };
+            records.sort_by_key(|(_, _, d)| std::cmp::Reverse(d.first_seen));
+            self.records = records;
+            self.trusted = self
                 .shared
-                .store
+                .trusted
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .entries();
-            records.sort_by_key(|r| std::cmp::Reverse(r.1.first_seen));
-            self.records = records;
             self.records_at = now;
         }
     }
@@ -206,6 +221,30 @@ impl ShieldApp {
         let _ = self.config.save(&self.config_path);
     }
 
+    /// Apply a trust toggle: update the registry (and, when trusting, mark the
+    /// app's recorded rows safe), then refresh the local snapshot. A failure is
+    /// surfaced like a store error, never swallowed.
+    fn set_trust(&mut self, exe: &str, trust: bool) {
+        let now = now_unix();
+        let mut trusted = self
+            .shared
+            .trusted
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let result = if trust {
+            let mut store = self.shared.store.lock().unwrap_or_else(|e| e.into_inner());
+            trusted
+                .trust(exe, now)
+                .and_then(|()| store.mark_app_safe(exe))
+        } else {
+            trusted.untrust(exe)
+        };
+        if let Err(err) = result {
+            self.last_error = Some(format!("trust update failed: {err}"));
+        }
+        self.trusted = trusted.entries();
+    }
+
     /// Where the startup reset sentinel lives (next to the store).
     fn reset_request_path(&self) -> PathBuf {
         self.store_path
@@ -238,6 +277,7 @@ impl ShieldApp {
             })
             .collect();
         rows.sort_by(|a, b| a.exe.cmp(&b.exe));
+        let trusted: HashSet<String> = self.trusted.iter().map(|(exe, _)| exe.clone()).collect();
 
         ui.horizontal(|ui| {
             core_strip(ui, &self.core_usage);
@@ -283,59 +323,20 @@ impl ShieldApp {
         }
         ui.add_space(8.0);
 
-        section(ui, &format!("LINKS // {}", rows.len()));
-        egui::ScrollArea::vertical()
-            .id_salt("conns")
-            .show(ui, |ui| {
-                egui::Grid::new("links")
-                    .num_columns(4)
-                    .spacing([14.0, 5.0])
-                    .show(ui, |ui| {
-                        let mut i = 0;
-                        while i < rows.len() {
-                            let app = short_exe(rows[i].exe.as_deref());
-                            let mut j = i;
-                            while j < rows.len() && short_exe(rows[j].exe.as_deref()) == app {
-                                j += 1;
-                            }
-                            for (k, c) in rows[i..j].iter().enumerate() {
-                                if k == 0 {
-                                    ui.horizontal(|ui| {
-                                        app_badge(ui, &app);
-                                        ui.label(
-                                            egui::RichText::new(app.to_uppercase())
-                                                .color(theme::cyan())
-                                                .strong(),
-                                        );
-                                        ui.label(
-                                            egui::RichText::new(format!("x{}", j - i))
-                                                .color(theme::dim())
-                                                .size(small(ui)),
-                                        );
-                                    });
-                                } else {
-                                    ui.label("");
-                                }
-                                let dest = c
-                                    .remote
-                                    .map(|r| r.to_string())
-                                    .unwrap_or_else(|| "-".into());
-                                ui.label(egui::RichText::new(dest).color(theme::text()));
-                                let pid =
-                                    c.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
-                                ui.label(
-                                    egui::RichText::new(pid).color(theme::dim()).size(small(ui)),
-                                );
-                                ui.label(
-                                    egui::RichText::new(state_name(&c.state))
-                                        .color(state_color(&c.state)),
-                                );
-                                ui.end_row();
-                            }
-                            i = j;
-                        }
-                    });
-            });
+        // Two panes: live links on the left, the apps you can trust on the right.
+        let mut toggle: Option<(String, bool)> = None;
+        let apps = &self.feed_apps;
+        ui.columns(2, |cols| {
+            let left = &mut cols[0];
+            section(left, &format!("LINKS // {}", rows.len()));
+            draw_links(left, &rows, &trusted);
+
+            let right = &mut cols[1];
+            draw_apps(right, apps, &trusted, &mut toggle);
+        });
+        if let Some((exe, trust)) = toggle {
+            self.set_trust(&exe, trust);
+        }
     }
 
     fn history(&mut self, ui: &mut egui::Ui) {
@@ -364,17 +365,21 @@ impl ShieldApp {
                             ui.label(egui::RichText::new(h).color(theme::dim()).size(small(ui)));
                         }
                         ui.end_row();
-                        for (ip, dest) in records {
+                        for (exe, ip, dest) in records {
                             ui.label(
                                 egui::RichText::new(format_ts(dest.first_seen, &tz))
                                     .color(theme::text())
                                     .size(small(ui)),
                             );
                             ui.label(
-                                egui::RichText::new(short_exe(Some(&dest.first_exe)))
-                                    .color(theme::cyan()),
+                                egui::RichText::new(short_exe(Some(exe))).color(theme::cyan()),
                             );
-                            ui.label(egui::RichText::new(ip.to_string()).color(theme::text()));
+                            let ip_color = if dest.safe {
+                                theme::green()
+                            } else {
+                                theme::text()
+                            };
+                            ui.label(egui::RichText::new(ip.to_string()).color(ip_color));
                             flag(ui, dest.reviewed, theme::text());
                             flag(ui, dest.safe, theme::green());
                             ui.end_row();
@@ -507,6 +512,42 @@ impl ShieldApp {
         if changed {
             self.save_config();
             self.apply_theme(ctx);
+        }
+
+        ui.add_space(12.0);
+        section(ui, &format!("TRUSTED APPS // {}", self.trusted.len()));
+        if self.trusted.is_empty() {
+            ui.label(
+                egui::RichText::new("// nothing trusted yet")
+                    .color(theme::dim())
+                    .size(small(ui)),
+            );
+        } else {
+            let mut untrust: Option<String> = None;
+            for (exe, app) in &self.trusted {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(&app.name)
+                            .color(theme::green())
+                            .strong(),
+                    );
+                    ui.label(egui::RichText::new(exe).color(theme::dim()).size(small(ui)));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .small_button("untrust")
+                            .on_hover_text(
+                                "Stop trusting this app; its future connections alert again.",
+                            )
+                            .clicked()
+                        {
+                            untrust = Some(exe.clone());
+                        }
+                    });
+                });
+            }
+            if let Some(exe) = untrust {
+                self.set_trust(&exe, false);
+            }
         }
 
         ui.add_space(12.0);
@@ -759,6 +800,124 @@ fn app_badge(ui: &mut egui::Ui, name: &str) {
     );
 }
 
+/// The left feed pane: live links grouped by app, IPs green when the app is
+/// trusted.
+fn draw_links(ui: &mut egui::Ui, rows: &[&Connection], trusted: &HashSet<String>) {
+    egui::ScrollArea::vertical()
+        .id_salt("conns")
+        .show(ui, |ui| {
+            egui::Grid::new("links")
+                .num_columns(4)
+                .spacing([14.0, 5.0])
+                .show(ui, |ui| {
+                    let mut i = 0;
+                    while i < rows.len() {
+                        let app = short_exe(rows[i].exe.as_deref());
+                        let is_trusted =
+                            rows[i].exe.as_deref().is_some_and(|e| trusted.contains(e));
+                        let mut j = i;
+                        while j < rows.len() && short_exe(rows[j].exe.as_deref()) == app {
+                            j += 1;
+                        }
+                        for (k, c) in rows[i..j].iter().enumerate() {
+                            if k == 0 {
+                                let color = if is_trusted {
+                                    theme::green()
+                                } else {
+                                    theme::cyan()
+                                };
+                                ui.horizontal(|ui| {
+                                    app_badge(ui, &app);
+                                    ui.label(
+                                        egui::RichText::new(app.to_uppercase())
+                                            .color(color)
+                                            .strong(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!("x{}", j - i))
+                                            .color(theme::dim())
+                                            .size(small(ui)),
+                                    );
+                                });
+                            } else {
+                                ui.label("");
+                            }
+                            let dest = c
+                                .remote
+                                .map(|r| r.to_string())
+                                .unwrap_or_else(|| "-".into());
+                            let dcol = if is_trusted {
+                                theme::green()
+                            } else {
+                                theme::text()
+                            };
+                            ui.label(egui::RichText::new(dest).color(dcol));
+                            let pid = c.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+                            ui.label(egui::RichText::new(pid).color(theme::dim()).size(small(ui)));
+                            ui.label(
+                                egui::RichText::new(state_name(&c.state))
+                                    .color(state_color(&c.state)),
+                            );
+                            ui.end_row();
+                        }
+                        i = j;
+                    }
+                });
+        });
+}
+
+/// The right feed pane: apps with at least one external connection, each with a
+/// trust checkbox. Records the toggle (exe + desired state) into `toggle`.
+fn draw_apps(
+    ui: &mut egui::Ui,
+    apps: &[AppRow],
+    trusted: &HashSet<String>,
+    toggle: &mut Option<(String, bool)>,
+) {
+    section(ui, &format!("APPS // {}", apps.len()));
+    ui.add_space(4.0);
+    if apps.is_empty() {
+        ui.label(
+            egui::RichText::new("// no app is connecting out")
+                .color(theme::dim())
+                .size(small(ui)),
+        );
+        return;
+    }
+    egui::ScrollArea::vertical().id_salt("apps").show(ui, |ui| {
+        for row in apps {
+            let name = short_exe(Some(&row.exe));
+            let is_trusted = trusted.contains(&row.exe);
+            let color = if is_trusted {
+                theme::green()
+            } else {
+                theme::cyan()
+            };
+            ui.horizontal(|ui| {
+                let mut checked = is_trusted;
+                if ui
+                    .checkbox(&mut checked, "")
+                    .on_hover_text(
+                        "Trust this app: its connections stop alerting and are stored safe.",
+                    )
+                    .changed()
+                {
+                    *toggle = Some((row.exe.clone(), checked));
+                }
+                ui.label(egui::RichText::new(name).color(color).strong());
+                let pid = row.pids.first().copied().unwrap_or(0).to_string();
+                ui.label(egui::RichText::new(pid).color(theme::dim()).size(small(ui)));
+            });
+            ui.label(
+                egui::RichText::new(&row.exe)
+                    .color(theme::dim())
+                    .size(small(ui)),
+            );
+            ui.add_space(4.0);
+        }
+    });
+}
+
 fn state_color(code: &str) -> egui::Color32 {
     match code {
         "01" => theme::green(),
@@ -955,6 +1114,7 @@ mod tests {
     fn app_with(rx: Receiver<Tick>) -> ShieldApp {
         let shared = Arc::new(Shared::new(
             shield_core::Destinations::in_memory(),
+            shield_core::TrustedApps::in_memory(),
             Config::default(),
         ));
         ShieldApp::new(
@@ -1013,6 +1173,7 @@ mod tests {
         let (_tx, rx) = channel::<Tick>();
         let shared = Arc::new(Shared::new(
             shield_core::Destinations::in_memory(),
+            shield_core::TrustedApps::in_memory(),
             Config::default(),
         ));
         let app = ShieldApp::new(

@@ -6,7 +6,8 @@ The system **as it is now**. Dated decision records live under `docs/design/`
 ## Purpose
 
 A local network sentinel: watch outbound TCP connections, attribute each to a
-process, and surface the first time it sees a new **destination** (a remote IP).
+process, and surface the first time it sees a new **destination** (an app and a
+remote IP).
 
 ## Philosophy
 
@@ -19,36 +20,40 @@ knowingly accepted weaknesses to get the overall structure in place, and close
 them one at a time, little by little. The current accepted gaps, each to be
 removed:
 
-- A new destination is stored `reviewed = true, safe = true`, so it goes quiet
-  after its first sighting. The target is `reviewed = false, safe = false` until
-  a human (or a trusted list) actually clears it.
-- No reputation / safe-list lookup yet: the directory is a local log, not a
-  verified verdict.
+- **Trust is by path, not by bytes.** Hashing is deferred (TODOS P2-3), so a
+  binary that replaces a trusted path inherits its trust until that lands.
+- No reputation / safe-list lookup yet: trust is the user's own judgement.
 - Attribution sees only this user's `/proc`; root and other users are invisible.
-- Destinations are IP-only; ports are ignored.
+- Destinations are keyed by `(app, IP)`; ports are ignored.
 
 ## Alerting
 
-One rule, in `classify`: the **first time** Shield sees a remote **IP**, it
-alerts and records it. After that the IP is known and never alerts again. There
-is no app-level trust; the destination is the unit.
+One rule, in `classify`, on the unit `(app, IP)`:
 
-- `quiet_browsers` bypasses browsers entirely — no alert and **not stored**.
-- `quiet_local` bypasses loopback the same way (default on).
+- A pair already seen is silent.
+- A **new pair from a trusted app** is recorded `reviewed = true, safe = true`
+  and does **not** alert.
+- A **new pair from any other app** is recorded `reviewed = false, safe = false`
+  and **alerts**.
 
-Each stored destination carries `reviewed` and `safe` flags. For now every
-destination is inserted `reviewed = true, safe = true` (quiet after its first
-sighting) — a knowingly accepted gap while the structure is built; see
-**Philosophy**.
+`quiet_browsers` bypasses browsers entirely — no alert and **not stored**;
+`quiet_local` does the same for loopback (default on). Both are skipped before
+the trust check, so they cannot seed the directory.
+
+Trust is **explicit** (a checkbox), **per app**, **persisted**, and never removed
+automatically. Trusting an app also marks its already-recorded rows safe. Because
+the unit includes the app, a trusted app cannot whitelist a destination for an
+untrusted one.
 
 ## Module map
 
 - `crates/shield-core` — no dependencies.
   - `/proc` parsing: `parse_proc_net`, `parse_addr`, `scan_proc` (one walk),
     `list_connections_with`, `snapshot`, `list_connections`, `list_processes`.
-  - Processes: `Process` (per-pid) and `AppRow` + `group_processes` (collapse to
-    one row per executable, for the PROCESSES tab and the future trust pane).
-  - Store: `Destinations` (the destination directory).
+  - Processes: `Process` (per-pid), `AppRow`, `group_processes` (PROCESSES tab)
+    and `group_connections` (the feed's app pane).
+  - Store: `Destinations` (the `(exe, ip)` directory) and `TrustedApps` (the
+    trust registry); `migrate_store` converts the legacy file; `app_name`.
   - Policy: `Config`, `classify`, `is_browser_exe`.
   - Metrics: `CpuSampler` (per-core load from `/proc/stat`).
 - `crates/shield-app` — binary `shield`.
@@ -63,15 +68,17 @@ sighting) — a knowingly accepted gap while the structure is built; see
 ## Data flow
 
 Monitor thread, every 5 s: `snapshot()` walks `/proc` **once**, yielding the
-connections and every readable process of this user → `classify(store, conns,
-now, config)` records new destinations (appending to the TSV) and returns alerts
+connections and every readable process of this user → `classify(store, trusted,
+conns, now, config)` records new pairs (appending to the TSV) and returns alerts
 → desktop notification + tray badge → sends `Tick { conns, procs, alerts,
-baselined, error }` to the GUI.
+baselined, error }` to the GUI. The monitor locks `trusted` then `store`.
 
-GUI thread: `drain()` consumes ticks and updates FEED (core meters, gauges,
-alert cards, live links); HISTORY is refreshed once per second; the CPU meters
-sample `/proc/stat` once per second on the GUI thread. Config edits in SETTINGS
-are written to disk and pushed into `Shared.config`.
+GUI thread: `drain()` consumes ticks and updates FEED (core meters, alert cards,
+and two panes: live links | apps with a trust checkbox); HISTORY and the trusted
+list are refreshed once per second; the CPU meters sample `/proc/stat` once per
+second on the GUI thread. Config edits are written and pushed into
+`Shared.config`; a trust toggle updates `Shared.trusted` (and marks that app's
+rows safe).
 
 ## Failure handling
 
@@ -93,13 +100,19 @@ cannot take the monitor down with it.
 
 ## Storage
 
-- **Destination directory:** `~/.local/share/shield/first-seen.tsv` (legacy
-  name), append-only, one line per IP:
-  `ip\tts\treviewed\tsafe\tfirst_exe`, where `ts` is **UTC epoch seconds**. The
-  old `exe\tip\tport\tts` format is migrated on load (to its IP).
-- **In memory:** `HashMap<IpAddr, Destination>`, where `Destination` =
-  `{ first_seen, first_exe, reviewed, safe }`. `entries()` feeds HISTORY;
-  `clear()` truncates the file.
+- **Destination directory:** `~/.local/share/shield/destinations.tsv`,
+  append-only, one line per `(exe, ip)`:
+  `exe \t ip \t ts \t reviewed \t safe`, where `ts` is **UTC epoch seconds**.
+  `mark_app_safe` rewrites the file when an app is trusted. A path containing a
+  tab would corrupt a row (documented limitation).
+- **Trust registry:** `~/.local/share/shield/trusted-apps.tsv`,
+  `exe \t name \t first_trusted`; rewritten on trust/untrust.
+- **In memory:** `HashMap<(String, IpAddr), Destination>` and
+  `HashMap<String, TrustedApp>`.
+- **Migration:** `migrate_store` converts a legacy `first-seen.tsv` (either the
+  `ip\tts\treviewed\tsafe\tfirst_exe` or the `exe\tip\tport\tts` shape) into
+  `destinations.tsv` once, before the store is opened; existing verdicts are
+  kept and browser rows are dropped.
 - **Reset sentinel:** `~/.local/share/shield/reset-requested`.
 
 ## Config
@@ -113,27 +126,35 @@ load.
 ## UI
 
 egui HUD with a header (status badge + a small **scan-cycle ring**) and four
-tabs. **FEED**: core level meters + separator, alert cards, and live links
-grouped by app (the current count is the `LINKS // N` heading). **HISTORY** /
-**DESTINATIONS**: grid of WHEN / WHO / WHERE / REVIEWED / SAFE, newest first.
-**PROCESSES**: every running executable of this user, one row per path, with
-APP / PATH / PIDS (count, pids on hover) / LINKS (current external
-connections); read-only and live from the scan. **SETTINGS**: policy,
-display / font size, time / timezone, paths, and Reset.
+tabs. **FEED**: core level meters + separator, alert cards, then two panes —
+left, live links grouped by app (the `LINKS // N` heading); right, the apps with
+an external connection, each with a trust checkbox, PID and path (`APPS // N`).
+Trusted apps and their destinations render green. **HISTORY** /
+**DESTINATIONS**: grid of WHEN / WHO / WHERE / REVIEWED / SAFE, newest first,
+safe rows green. **PROCESSES**: every running executable of this user, one row
+per path, APP / PATH / PIDS (count, pids on hover) / LINKS; read-only and live
+from the scan. **SETTINGS**: policy, display / font size, time / timezone,
+trusted apps (with untrust), paths, and Reset.
 Shortcuts: Ctrl +/- font, Ctrl 0 reset font, Ctrl T test alert. The
 header ring fills over one `SCAN_INTERVAL` (5 s) and resets; the window repaints
 about 10 times a second so it animates smoothly.
 
 ## Runtime paths
 
-- Store `~/.local/share/shield/first-seen.tsv`
+- Destinations `~/.local/share/shield/destinations.tsv`
+- Trust registry `~/.local/share/shield/trusted-apps.tsv`
+- Legacy (read once) `~/.local/share/shield/first-seen.tsv`
 - Reset sentinel `~/.local/share/shield/reset-requested`
 - Config `~/.config/shield/config.toml`
 
 ## Invariants
 
-- One alert kind: a new destination (remote IP) is alerted once, then known.
-  Browsers (quiet) and loopback (quiet) are bypassed entirely.
+- One alert kind: a new `(app, IP)` pair from an untrusted app is alerted once,
+  then known. A trusted app's pairs are silent and stored safe.
+- Browsers (quiet) and loopback (quiet) are bypassed entirely, before the trust
+  check.
+- Trust reduces alerts, never coverage: the destination row is always kept.
+  Trust is explicit, persisted, and never removed automatically.
 - A failed scan or store write is always visible in the UI; it never presents as
   `CALM`.
 - Userspace only; no privileges beyond reading `/proc` and its own data files.
@@ -164,5 +185,9 @@ about 10 times a second so it animates smoothly.
   instead of showing `CALM`.
 - 2026-10-06 — [trusted apps, phase 1](2026-10-06-trusted-apps-design.md): a
   PROCESSES tab (every running executable of this user, grouped by path) and one
-  `/proc` snapshot per scan shared by connections and processes. No store change
-  yet; trust is phase 2.
+  `/proc` snapshot per scan shared by connections and processes.
+- 2026-10-06 — [trusted apps, phase 2](2026-10-06-trusted-apps-design.md):
+  destinations keyed by `(app, IP)`; explicit per-app trust (`trusted-apps.tsv`)
+  makes an app's pairs safe and silent while untrusted apps still alert on a new
+  pair; `first-seen.tsv` migrated to `destinations.tsv`; FEED is now two panes
+  (links | apps with a trust checkbox); SETTINGS lists trusted apps.

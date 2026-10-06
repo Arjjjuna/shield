@@ -138,6 +138,36 @@ pub fn group_processes(procs: &[Process]) -> Vec<AppRow> {
     rows
 }
 
+/// Collapse live connections into one row per executable: unique pids and the
+/// number of external (non-loopback) links, sorted by executable path. Used by
+/// the right feed pane; loopback is never counted.
+pub fn group_connections(conns: &[Connection]) -> Vec<AppRow> {
+    let mut by_exe: HashMap<String, AppRow> = HashMap::new();
+    for c in conns {
+        let Some(exe) = c.exe.clone() else { continue };
+        if c.remote.is_some_and(|r| r.ip().is_loopback()) {
+            continue;
+        }
+        let row = by_exe.entry(exe.clone()).or_insert_with(|| AppRow {
+            exe,
+            pids: Vec::new(),
+            connections: 0,
+        });
+        row.connections += 1;
+        if let Some(pid) = c.pid {
+            if !row.pids.contains(&pid) {
+                row.pids.push(pid);
+            }
+        }
+    }
+    let mut rows: Vec<AppRow> = by_exe.into_values().collect();
+    for row in &mut rows {
+        row.pids.sort_unstable();
+    }
+    rows.sort_by(|a, b| a.exe.cmp(&b.exe));
+    rows
+}
+
 /// Attach per-pid connection counts to raw `(pid, exe)` pairs, sorted by
 /// `(exe, pid)` for a stable list.
 fn build_processes(
@@ -272,16 +302,17 @@ pub fn list_connections() -> Vec<Connection> {
     list_connections_with(&scan_proc().0)
 }
 
-/// A known destination: one remote IP we have seen, with its verdict.
+/// A known destination: a remote IP a given executable has contacted, with its
+/// verdict. Kept per `(exe, ip)` so trust is per-app (trusted-apps design A2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Destination {
     /// First-seen UTC epoch seconds.
     pub first_seen: u64,
-    /// The first executable seen contacting it.
-    pub first_exe: String,
-    /// Whether a human has looked at it. (Utopia: false on insert.)
+    /// Whether it has a verdict. A trusted app inserts `true`; an unknown app
+    /// inserts `false` until that app is trusted.
     pub reviewed: bool,
-    /// Whether it is considered safe. (Utopia: unknown until reviewed.)
+    /// Whether it is considered safe. A trusted app inserts `true`; an unknown
+    /// app inserts `false`.
     pub safe: bool,
 }
 
@@ -309,15 +340,15 @@ impl Alert {
     }
 }
 
-/// Directory of remote IP destinations Shield has seen.
+/// Directory of remote destinations Shield has seen, keyed by `(exe, ip)`.
 ///
-/// Persists as an append-only `ip\tts\treviewed\tsafe\tfirst_exe` file when
-/// given a path, or stays in memory for tests. The legacy
-/// `exe\tip\tport\tts` format is migrated on load.
+/// Persists as an append-only `exe \t ip \t ts \t reviewed \t safe` file when
+/// given a path, or stays in memory for tests. A legacy `first-seen.tsv` is
+/// converted once by `migrate_store`, never read here.
 #[derive(Debug, Default)]
 pub struct Destinations {
     path: Option<PathBuf>,
-    destinations: HashMap<IpAddr, Destination>,
+    destinations: HashMap<(String, IpAddr), Destination>,
 }
 
 impl Destinations {
@@ -336,9 +367,8 @@ impl Destinations {
         match fs::read_to_string(&path) {
             Ok(content) => {
                 for line in content.lines() {
-                    let fields: Vec<&str> = line.split('\t').collect();
-                    if let Some((ip, dest)) = parse_line(&fields) {
-                        store.destinations.entry(ip).or_insert(dest);
+                    if let Some((key, dest)) = parse_destination_line(line) {
+                        store.destinations.entry(key).or_insert(dest);
                     }
                 }
             }
@@ -351,8 +381,8 @@ impl Destinations {
         Ok(store)
     }
 
-    pub fn is_known(&self, ip: IpAddr) -> bool {
-        self.destinations.contains_key(&ip)
+    pub fn is_known(&self, exe: &str, ip: IpAddr) -> bool {
+        self.destinations.contains_key(&(exe.to_string(), ip))
     }
 
     pub fn len(&self) -> usize {
@@ -363,11 +393,11 @@ impl Destinations {
         self.destinations.is_empty()
     }
 
-    /// Every destination with its metadata, for display.
-    pub fn entries(&self) -> Vec<(IpAddr, Destination)> {
+    /// Every destination with its key, for display.
+    pub fn entries(&self) -> Vec<(String, IpAddr, Destination)> {
         self.destinations
             .iter()
-            .map(|(ip, dest)| (*ip, dest.clone()))
+            .map(|((exe, ip), dest)| (exe.clone(), *ip, dest.clone()))
             .collect()
     }
 
@@ -389,75 +419,313 @@ impl Destinations {
     }
 
     /// Record a destination. Returns `true` when it was new (and appends to
-    /// disk). A known destination is left untouched, so it is never re-flagged.
-    pub fn record(&mut self, ip: IpAddr, exe: &str, ts: u64) -> io::Result<bool> {
-        if self.destinations.contains_key(&ip) {
+    /// disk). A known pair is left untouched. `reviewed`/`safe` are the caller's
+    /// verdict: a trusted app passes `true`/`true`, an unknown app
+    /// `false`/`false`.
+    pub fn record(
+        &mut self,
+        exe: &str,
+        ip: IpAddr,
+        ts: u64,
+        reviewed: bool,
+        safe: bool,
+    ) -> io::Result<bool> {
+        let key = (exe.to_string(), ip);
+        if self.destinations.contains_key(&key) {
             return Ok(false);
         }
-        // For now every destination counts as reviewed and safe. The utopia
-        // inserts reviewed = false, safe = false instead, pending a real review.
         let dest = Destination {
             first_seen: ts,
-            first_exe: exe.to_string(),
-            reviewed: true,
-            safe: true,
+            reviewed,
+            safe,
         };
         if let Some(path) = &self.path {
             if let Some(parent) = path.parent() {
-                fs::create_dir_all(parent)?;
+                if !parent.as_os_str().is_empty() {
+                    fs::create_dir_all(parent)?;
+                }
             }
             let mut file = OpenOptions::new().create(true).append(true).open(path)?;
-            writeln!(file, "{ip}\t{ts}\t{}\t{}\t{exe}", dest.reviewed, dest.safe)?;
+            writeln!(file, "{exe}\t{ip}\t{ts}\t{}\t{}", dest.reviewed, dest.safe)?;
         }
-        self.destinations.insert(ip, dest);
+        self.destinations.insert(key, dest);
         Ok(true)
+    }
+
+    /// Mark every recorded destination of `exe` reviewed and safe, rewriting the
+    /// file. Used when the user trusts an app (retroactive).
+    pub fn mark_app_safe(&mut self, exe: &str) -> io::Result<()> {
+        let mut changed = false;
+        for ((e, _), dest) in self.destinations.iter_mut() {
+            if e == exe && !(dest.reviewed && dest.safe) {
+                dest.reviewed = true;
+                dest.safe = true;
+                changed = true;
+            }
+        }
+        if changed {
+            self.rewrite()?;
+        }
+        Ok(())
+    }
+
+    /// Rewrite the whole file from memory (after a bulk update).
+    fn rewrite(&self) -> io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let mut lines: Vec<String> = self
+            .destinations
+            .iter()
+            .map(|((exe, ip), d)| {
+                format!(
+                    "{exe}\t{ip}\t{}\t{}\t{}\n",
+                    d.first_seen, d.reviewed, d.safe
+                )
+            })
+            .collect();
+        lines.sort();
+        fs::write(path, lines.concat())
     }
 }
 
-/// Parse one store line in either the new `ip\tts\treviewed\tsafe\tfirst_exe`
-/// format or the legacy `exe\tip\tport\tts` format.
-fn parse_line(fields: &[&str]) -> Option<(IpAddr, Destination)> {
-    let truthy = |v: &str| {
-        matches!(
-            v.trim().to_ascii_lowercase().as_str(),
-            "true" | "1" | "yes" | "on"
-        )
-    };
-    if let Some(ip) = fields.first().and_then(|f| f.parse::<IpAddr>().ok()) {
-        // New format.
+/// Truthy parsing for stored flag values.
+fn truthy(v: &str) -> bool {
+    matches!(
+        v.trim().to_ascii_lowercase().as_str(),
+        "true" | "1" | "yes" | "on"
+    )
+}
+
+/// Parse one line of the current store: `exe \t ip \t ts \t reviewed \t safe`.
+fn parse_destination_line(line: &str) -> Option<((String, IpAddr), Destination)> {
+    let f: Vec<&str> = line.split('\t').collect();
+    let exe = f.first().filter(|s| !s.is_empty())?.to_string();
+    let ip = f.get(1)?.parse::<IpAddr>().ok()?;
+    Some((
+        (exe, ip),
+        Destination {
+            first_seen: f.get(2).and_then(|t| t.parse().ok()).unwrap_or(0),
+            reviewed: f.get(3).map(|v| truthy(v)).unwrap_or(false),
+            safe: f.get(4).map(|v| truthy(v)).unwrap_or(false),
+        },
+    ))
+}
+
+/// Parse one line of a legacy `first-seen.tsv`, in either historical shape:
+/// `ip \t ts \t reviewed \t safe \t first_exe`, or `exe \t ip \t port \t ts`.
+fn parse_legacy_line(line: &str) -> Option<(String, IpAddr, Destination)> {
+    let f: Vec<&str> = line.split('\t').collect();
+    // Current legacy format: the first field is the IP.
+    if let Some(ip) = f.first().and_then(|s| s.parse::<IpAddr>().ok()) {
+        let exe = f.get(4).filter(|s| !s.is_empty())?.to_string();
         return Some((
+            exe,
             ip,
             Destination {
-                first_seen: fields
-                    .get(1)
-                    .and_then(|t| t.parse::<u64>().ok())
-                    .unwrap_or(0),
-                first_exe: fields.get(4).map(|s| s.to_string()).unwrap_or_default(),
-                reviewed: fields.get(2).map(|v| truthy(v)).unwrap_or(true),
-                safe: fields.get(3).map(|v| truthy(v)).unwrap_or(true),
+                first_seen: f.get(1).and_then(|t| t.parse().ok()).unwrap_or(0),
+                reviewed: f.get(2).map(|v| truthy(v)).unwrap_or(true),
+                safe: f.get(3).map(|v| truthy(v)).unwrap_or(true),
             },
         ));
     }
-    // Legacy format: exe \t ip \t port \t ts.
-    let first_exe = fields.first().map(|s| s.to_string()).unwrap_or_default();
-    // Browsers are bypassed under the new rule, so an old browser row must not
-    // whitelist the IP it visited.
-    if is_browser_exe(&first_exe) {
+    // Original format: `exe \t ip \t port \t ts`. Browser rows are dropped so
+    // they cannot whitelist the IP they visited.
+    let exe = f.first()?.to_string();
+    if exe.is_empty() || is_browser_exe(&exe) {
         return None;
     }
-    let ip = fields.get(1)?.parse::<IpAddr>().ok()?;
+    let ip = f.get(1)?.parse::<IpAddr>().ok()?;
     Some((
+        exe,
         ip,
         Destination {
-            first_seen: fields
-                .get(3)
-                .and_then(|t| t.parse::<u64>().ok())
-                .unwrap_or(0),
-            first_exe,
+            first_seen: f.get(3).and_then(|t| t.parse().ok()).unwrap_or(0),
             reviewed: true,
             safe: true,
         },
     ))
+}
+
+/// One-time migration from a legacy `first-seen.tsv` to the `(exe, ip)`
+/// `destinations.tsv`. Does nothing (`Ok(false)`) if `destinations` already
+/// exists or the legacy file is absent. Returns `true` when it wrote the new
+/// file. Existing verdicts are preserved, so nothing re-alerts.
+pub fn migrate_store(legacy: impl AsRef<Path>, destinations: impl AsRef<Path>) -> io::Result<bool> {
+    let destinations = destinations.as_ref();
+    if destinations.exists() {
+        return Ok(false);
+    }
+    let content = match fs::read_to_string(legacy.as_ref()) {
+        Ok(content) => content,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(err),
+    };
+    let mut merged: HashMap<(String, IpAddr), Destination> = HashMap::new();
+    for line in content.lines() {
+        let Some((exe, ip, dest)) = parse_legacy_line(line) else {
+            continue;
+        };
+        match merged.get_mut(&(exe.clone(), ip)) {
+            // Earliest first-seen wins; a safe verdict from any row sticks.
+            Some(existing) => {
+                if dest.first_seen != 0
+                    && (existing.first_seen == 0 || dest.first_seen < existing.first_seen)
+                {
+                    existing.first_seen = dest.first_seen;
+                }
+                existing.reviewed |= dest.reviewed;
+                existing.safe |= dest.safe;
+            }
+            None => {
+                merged.insert((exe, ip), dest);
+            }
+        }
+    }
+    if merged.is_empty() {
+        return Ok(false);
+    }
+    if let Some(parent) = destinations.parent() {
+        if !parent.as_os_str().is_empty() {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let mut lines: Vec<String> = merged
+        .iter()
+        .map(|((exe, ip), d)| {
+            format!(
+                "{exe}\t{ip}\t{}\t{}\t{}\n",
+                d.first_seen, d.reviewed, d.safe
+            )
+        })
+        .collect();
+    lines.sort();
+    fs::write(destinations, lines.concat())?;
+    Ok(true)
+}
+
+/// One app the user has explicitly trusted, pinned by executable path (v1;
+/// content hashing is deferred, TODOS P2-3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TrustedApp {
+    pub name: String,
+    pub first_trusted: u64,
+}
+
+/// Apps the user has explicitly entrusted. Persists as
+/// `exe \t name \t first_trusted`; absent means nothing is trusted.
+#[derive(Debug, Default)]
+pub struct TrustedApps {
+    path: Option<PathBuf>,
+    apps: HashMap<String, TrustedApp>,
+}
+
+impl TrustedApps {
+    /// An empty, non-persistent trust list (for tests and dry runs).
+    pub fn in_memory() -> Self {
+        Self::default()
+    }
+
+    /// Load from `path` (missing file means nothing is trusted).
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let mut store = Self {
+            path: Some(path.clone()),
+            ..Self::default()
+        };
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                for line in content.lines() {
+                    let f: Vec<&str> = line.split('\t').collect();
+                    let Some(exe) = f.first().filter(|s| !s.is_empty()).map(|s| s.to_string())
+                    else {
+                        continue;
+                    };
+                    let name = f
+                        .get(1)
+                        .filter(|s| !s.is_empty())
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| app_name(&exe));
+                    let first_trusted = f.get(2).and_then(|t| t.parse().ok()).unwrap_or(0);
+                    store.apps.entry(exe).or_insert(TrustedApp {
+                        name,
+                        first_trusted,
+                    });
+                }
+            }
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
+        }
+        Ok(store)
+    }
+
+    pub fn is_trusted(&self, exe: &str) -> bool {
+        self.apps.contains_key(exe)
+    }
+
+    pub fn len(&self) -> usize {
+        self.apps.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.apps.is_empty()
+    }
+
+    /// Every trusted app with its metadata, for display, sorted by name.
+    pub fn entries(&self) -> Vec<(String, TrustedApp)> {
+        let mut out: Vec<(String, TrustedApp)> = self
+            .apps
+            .iter()
+            .map(|(e, a)| (e.clone(), a.clone()))
+            .collect();
+        out.sort_by(|a, b| a.1.name.cmp(&b.1.name));
+        out
+    }
+
+    /// Trust `exe` (idempotent) and persist the list.
+    pub fn trust(&mut self, exe: &str, ts: u64) -> io::Result<()> {
+        self.apps.entry(exe.to_string()).or_insert(TrustedApp {
+            name: app_name(exe),
+            first_trusted: ts,
+        });
+        self.rewrite()
+    }
+
+    /// Remove trust from `exe` (idempotent) and persist the list.
+    pub fn untrust(&mut self, exe: &str) -> io::Result<()> {
+        if self.apps.remove(exe).is_none() {
+            return Ok(());
+        }
+        self.rewrite()
+    }
+
+    fn rewrite(&self) -> io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                fs::create_dir_all(parent)?;
+            }
+        }
+        let mut lines: Vec<String> = self
+            .apps
+            .iter()
+            .map(|(exe, app)| format!("{exe}\t{}\t{}\n", app.name, app.first_trusted))
+            .collect();
+        lines.sort();
+        fs::write(path, lines.concat())
+    }
+}
+
+/// The display name of an executable: its basename.
+pub fn app_name(exe: &str) -> String {
+    exe.rsplit('/').next().unwrap_or(exe).to_string()
 }
 
 /// Whether an executable looks like a web browser. Browsers churn through CDN
@@ -584,14 +852,22 @@ impl Config {
     }
 }
 
-/// Classify a snapshot against the destination directory.
+/// Classify a snapshot against the destination directory and the trust list.
 ///
-/// One rule: the first time we see a remote IP, alert and record it. Browsers
-/// (when `quiet_browsers`) and loopback (when `quiet_local`) are bypassed
-/// entirely - neither alerted nor stored - so they cannot whitelist an IP for
-/// anything else.
+/// For each surviving connection `(exe, ip)`:
+///
+/// - a known pair is silent;
+/// - a new pair from a trusted app is recorded `reviewed = safe = true` and does
+///   not alert;
+/// - a new pair from any other app is recorded `reviewed = safe = false` and
+///   alerts.
+///
+/// Browsers (when `quiet_browsers`) and loopback (when `quiet_local`) are
+/// bypassed entirely - neither alerted nor stored - so they cannot whitelist a
+/// destination for another app.
 pub fn classify(
     store: &mut Destinations,
+    trusted: &TrustedApps,
     conns: &[Connection],
     now: u64,
     config: &Config,
@@ -611,7 +887,8 @@ pub fn classify(
         if config.quiet_browsers && is_browser_exe(exe) {
             continue;
         }
-        if store.record(remote.ip(), exe, now)? {
+        let is_trusted = trusted.is_trusted(exe);
+        if store.record(exe, remote.ip(), now, is_trusted, is_trusted)? && !is_trusted {
             alerts.push(Alert {
                 pid: c.pid,
                 exe: exe.to_string(),
@@ -623,10 +900,15 @@ pub fn classify(
     Ok(alerts)
 }
 
-/// Snapshot the machine and classify it against the destination directory.
-pub fn scan(store: &mut Destinations, now: u64, config: &Config) -> io::Result<Vec<Alert>> {
+/// Snapshot the machine and classify it against the directory and trust list.
+pub fn scan(
+    store: &mut Destinations,
+    trusted: &TrustedApps,
+    now: u64,
+    config: &Config,
+) -> io::Result<Vec<Alert>> {
     let conns = list_connections();
-    classify(store, &conns, now, config)
+    classify(store, trusted, &conns, now, config)
 }
 
 /// Seconds since the Unix epoch, or 0 if the clock is before it.
@@ -767,41 +1049,50 @@ mod tests {
     #[test]
     fn new_destination_alerts_once_then_is_calm() {
         let mut store = Destinations::in_memory();
+        let trusted = TrustedApps::in_memory();
         let conns = vec![
             conn(100, "/usr/bin/curl", "93.184.216.34", 443, 10),
             conn(100, "/usr/bin/curl", "93.184.216.35", 443, 11),
         ];
-        let alerts = classify(&mut store, &conns, 1, &Config::default()).unwrap();
-        // One alert per new IP.
+        let alerts = classify(&mut store, &trusted, &conns, 1, &Config::default()).unwrap();
+        // One alert per new pair; an untrusted pair is stored unverified (G2).
         assert_eq!(alerts.len(), 2);
         assert!(alerts[0].describe().contains("93.184.216.34"));
         assert_eq!(store.len(), 2);
+        let d = store.entries().into_iter().next().unwrap().2;
+        assert!(!d.reviewed && !d.safe);
 
-        let again = classify(&mut store, &conns, 2, &Config::default()).unwrap();
+        let again = classify(&mut store, &trusted, &conns, 2, &Config::default()).unwrap();
         assert!(again.is_empty());
     }
 
     #[test]
-    fn same_ip_from_two_apps_alerts_once() {
+    fn same_ip_from_two_apps_is_two_pairs() {
+        // Under (app, ip) keying, a second app reaching a known IP is a new
+        // pair, so it alerts. That is the point of A2: trust is per-app.
         let mut store = Destinations::in_memory();
+        let trusted = TrustedApps::in_memory();
         let first = vec![conn(1, "/usr/bin/curl", "1.2.3.4", 443, 10)];
         let second = vec![conn(2, "/usr/bin/wget", "1.2.3.4", 80, 11)];
         assert_eq!(
-            classify(&mut store, &first, 1, &Config::default())
+            classify(&mut store, &trusted, &first, 1, &Config::default())
                 .unwrap()
                 .len(),
             1
         );
-        // The IP is known now, so another app reaching it is silent.
-        assert!(classify(&mut store, &second, 2, &Config::default())
-            .unwrap()
-            .is_empty());
-        assert_eq!(store.len(), 1);
+        assert_eq!(
+            classify(&mut store, &trusted, &second, 2, &Config::default())
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(store.len(), 2);
     }
 
     #[test]
     fn ignores_loopback_unowned_and_kernel_rows() {
         let mut store = Destinations::in_memory();
+        let trusted = TrustedApps::in_memory();
         let mut no_pid = conn(0, "/usr/bin/x", "8.8.8.8", 443, 10);
         no_pid.pid = None;
         no_pid.exe = None;
@@ -810,7 +1101,7 @@ mod tests {
             no_pid,
             conn(100, "/usr/bin/curl", "8.8.8.8", 443, 0),
         ];
-        let alerts = classify(&mut store, &conns, 1, &Config::default()).unwrap();
+        let alerts = classify(&mut store, &trusted, &conns, 1, &Config::default()).unwrap();
         // loopback (quiet_local on), a missing exe, and a kernel row are skipped.
         assert!(alerts.is_empty());
         assert!(store.is_empty());
@@ -819,8 +1110,9 @@ mod tests {
     #[test]
     fn browsers_are_bypassed_entirely() {
         let mut store = Destinations::in_memory();
+        let trusted = TrustedApps::in_memory();
         let conns = vec![conn(1, "/usr/lib/firefox/firefox-bin", "2.2.2.2", 443, 10)];
-        let alerts = classify(&mut store, &conns, 1, &Config::default()).unwrap();
+        let alerts = classify(&mut store, &trusted, &conns, 1, &Config::default()).unwrap();
         assert!(alerts.is_empty());
         // Not stored, so it cannot whitelist the IP for another app.
         assert!(store.is_empty());
@@ -829,14 +1121,15 @@ mod tests {
     #[test]
     fn loopback_is_alerted_when_quiet_local_is_off() {
         let mut store = Destinations::in_memory();
+        let trusted = TrustedApps::in_memory();
         let conns = vec![conn(1, "/usr/bin/curl", "127.0.0.1", 8080, 10)];
         let config = Config {
             quiet_local: false,
             ..Config::default()
         };
-        let alerts = classify(&mut store, &conns, 1, &config).unwrap();
+        let alerts = classify(&mut store, &trusted, &conns, 1, &config).unwrap();
         assert_eq!(alerts.len(), 1);
-        assert!(store.is_known("127.0.0.1".parse().unwrap()));
+        assert!(store.is_known("/usr/bin/curl", "127.0.0.1".parse().unwrap()));
     }
 
     #[test]
@@ -927,56 +1220,84 @@ mod tests {
         let mut store = Destinations::open(&path).unwrap();
         assert!(store.is_empty());
         assert!(store
-            .record("93.184.216.34".parse().unwrap(), "/usr/bin/curl", 1)
+            .record(
+                "/usr/bin/curl",
+                "93.184.216.34".parse().unwrap(),
+                1,
+                true,
+                true
+            )
             .unwrap());
 
         let reloaded = Destinations::open(&path).unwrap();
         let entries = reloaded.entries();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].0, "93.184.216.34".parse::<IpAddr>().unwrap());
-        assert_eq!(entries[0].1.first_seen, 1);
-        assert_eq!(entries[0].1.first_exe, "/usr/bin/curl");
-        assert!(entries[0].1.reviewed && entries[0].1.safe);
+        assert_eq!(entries[0].0, "/usr/bin/curl");
+        assert_eq!(entries[0].1, "93.184.216.34".parse::<IpAddr>().unwrap());
+        assert_eq!(entries[0].2.first_seen, 1);
+        assert!(entries[0].2.reviewed && entries[0].2.safe);
 
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
     }
 
     #[test]
-    fn open_reads_new_and_legacy_formats() {
-        let dir = std::env::temp_dir().join(format!("shield-ts-{}", std::process::id()));
+    fn open_reads_the_current_format() {
+        let dir = std::env::temp_dir().join(format!("shield-new-{}", std::process::id()));
         let path = dir.join("destinations.tsv");
         let _ = fs::create_dir_all(&dir);
         fs::write(
             &path,
-            // new: ip \t ts \t reviewed \t safe \t first_exe
+            "/usr/bin/a\t1.1.1.1\t1700000000\ttrue\ttrue\n\
+             /usr/bin/b\t2.2.2.2\t1700000001\tfalse\tfalse\n",
+        )
+        .unwrap();
+        let store = Destinations::open(&path).unwrap();
+        assert_eq!(store.len(), 2);
+        assert!(store.is_known("/usr/bin/a", "1.1.1.1".parse().unwrap()));
+        let entries = store.entries();
+        let a = entries
+            .iter()
+            .find(|(exe, _, _)| exe == "/usr/bin/a")
+            .unwrap();
+        assert_eq!(a.2.first_seen, 1_700_000_000);
+        assert!(a.2.reviewed && a.2.safe);
+        let b = entries
+            .iter()
+            .find(|(exe, _, _)| exe == "/usr/bin/b")
+            .unwrap();
+        assert!(!b.2.reviewed && !b.2.safe);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn migrate_store_converts_both_legacy_shapes() {
+        let dir = std::env::temp_dir().join(format!("shield-mig-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        let legacy = dir.join("first-seen.tsv");
+        let dest = dir.join("destinations.tsv");
+        let _ = fs::remove_file(&dest);
+        // Line 1 is the current legacy shape (first field is the IP); lines 2-3
+        // are the original shape (exe, ip, port, ts); line 3 is a browser row.
+        fs::write(
+            &legacy,
             "1.1.1.1\t1700000000\ttrue\ttrue\t/usr/bin/a\n\
              /usr/bin/b\t2.2.2.2\t80\t1700000001\n\
              /usr/lib/firefox/firefox-bin\t3.3.3.3\t443\t1700000002\n",
         )
         .unwrap();
-        let store = Destinations::open(&path).unwrap();
+        assert!(migrate_store(&legacy, &dest).unwrap());
+        let store = Destinations::open(&dest).unwrap();
+        // The browser row is dropped; the other two become (exe, ip) pairs.
         assert_eq!(store.len(), 2);
-        // A legacy browser row is dropped, not allowed to whitelist its IP.
-        assert!(!store.is_known("3.3.3.3".parse().unwrap()));
-        let entries = store.entries();
-        let by_ip = |ip: &str| {
-            entries
-                .iter()
-                .find(|(k, _)| *k == ip.parse::<IpAddr>().unwrap())
-                .unwrap()
-                .1
-                .clone()
-        };
-        let d1 = by_ip("1.1.1.1");
-        assert_eq!(d1.first_seen, 1_700_000_000);
-        assert_eq!(d1.first_exe, "/usr/bin/a");
-        // Legacy line migrates to the IP, reviewed and safe.
-        let d2 = by_ip("2.2.2.2");
-        assert_eq!(d2.first_seen, 1_700_000_001);
-        assert_eq!(d2.first_exe, "/usr/bin/b");
-        assert!(d2.reviewed && d2.safe);
-        let _ = fs::remove_file(&path);
+        assert!(store.is_known("/usr/bin/a", "1.1.1.1".parse().unwrap()));
+        assert!(store.is_known("/usr/bin/b", "2.2.2.2".parse().unwrap()));
+        assert!(!store.is_known("/usr/lib/firefox/firefox-bin", "3.3.3.3".parse().unwrap()));
+        // Re-running does nothing once the destination file exists.
+        assert!(!migrate_store(&legacy, &dest).unwrap());
+        let _ = fs::remove_file(&legacy);
+        let _ = fs::remove_file(&dest);
         let _ = fs::remove_dir(&dir);
     }
 
@@ -1050,13 +1371,31 @@ mod tests {
     }
 
     #[test]
+    fn group_connections_counts_external_links_by_app() {
+        let conns = vec![
+            conn(1, "/usr/bin/a", "1.2.3.4", 443, 10),
+            conn(1, "/usr/bin/a", "5.6.7.8", 443, 11),
+            conn(2, "/usr/bin/a", "127.0.0.1", 8080, 12),
+            conn(3, "/usr/bin/b", "9.9.9.9", 80, 13),
+        ];
+        let rows = group_connections(&conns);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].exe, "/usr/bin/a");
+        // The loopback link is excluded, so only two external links remain.
+        assert_eq!(rows[0].connections, 2);
+        assert_eq!(rows[0].pids, vec![1]);
+        assert_eq!(rows[1].exe, "/usr/bin/b");
+        assert_eq!(rows[1].connections, 1);
+    }
+
+    #[test]
     fn clear_empties_memory_and_truncates_file() {
         let dir = std::env::temp_dir().join(format!("shield-clear-{}", std::process::id()));
         let path = dir.join("destinations.tsv");
         let _ = fs::create_dir_all(&dir);
         let mut store = Destinations::open(&path).unwrap();
         assert!(store
-            .record("1.1.1.1".parse().unwrap(), "/usr/bin/a", 5)
+            .record("/usr/bin/a", "1.1.1.1".parse().unwrap(), 5, true, true)
             .unwrap());
         assert_eq!(store.len(), 1);
         store.clear().unwrap();
@@ -1067,22 +1406,77 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_record_does_not_append_or_change_time() {
+    fn duplicate_pair_does_not_append_but_a_new_pair_does() {
         let dir = std::env::temp_dir().join(format!("shield-dup-{}", std::process::id()));
         let path = dir.join("destinations.tsv");
         let _ = fs::create_dir_all(&dir);
         let mut store = Destinations::open(&path).unwrap();
         assert!(store
-            .record("1.1.1.1".parse().unwrap(), "/usr/bin/a", 5)
+            .record("/usr/bin/a", "1.1.1.1".parse().unwrap(), 5, false, false)
             .unwrap());
+        // Same pair again: no append and no change.
         assert!(!store
-            .record("1.1.1.1".parse().unwrap(), "/usr/bin/b", 99)
+            .record("/usr/bin/a", "1.1.1.1".parse().unwrap(), 99, true, true)
             .unwrap());
-        assert_eq!(store.len(), 1);
+        // A different app on the same IP is a different pair: recorded.
+        assert!(store
+            .record("/usr/bin/b", "1.1.1.1".parse().unwrap(), 7, false, false)
+            .unwrap());
+        assert_eq!(store.len(), 2);
         let entries = store.entries();
-        assert_eq!(entries[0].1.first_seen, 5);
-        assert_eq!(entries[0].1.first_exe, "/usr/bin/a");
-        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 1);
+        let a = entries
+            .iter()
+            .find(|(exe, _, _)| exe == "/usr/bin/a")
+            .unwrap();
+        assert_eq!(a.2.first_seen, 5);
+        assert!(!a.2.safe);
+        assert_eq!(fs::read_to_string(&path).unwrap().lines().count(), 2);
+        let _ = fs::remove_file(&path);
+        let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn trusted_app_records_safe_and_is_silent() {
+        let mut store = Destinations::in_memory();
+        let mut trusted = TrustedApps::in_memory();
+        trusted.trust("/usr/bin/curl", 1).unwrap();
+        let conns = vec![conn(1, "/usr/bin/curl", "1.2.3.4", 443, 10)];
+        let alerts = classify(&mut store, &trusted, &conns, 5, &Config::default()).unwrap();
+        assert!(alerts.is_empty());
+        let d = store.entries().into_iter().next().unwrap().2;
+        assert!(d.reviewed && d.safe);
+    }
+
+    #[test]
+    fn trusting_an_app_marks_existing_rows_safe() {
+        let mut store = Destinations::in_memory();
+        let trusted = TrustedApps::in_memory();
+        let conns = vec![conn(1, "/usr/bin/curl", "1.2.3.4", 443, 10)];
+        classify(&mut store, &trusted, &conns, 1, &Config::default()).unwrap();
+        assert!(!store.entries()[0].2.safe);
+        store.mark_app_safe("/usr/bin/curl").unwrap();
+        assert!(store.entries()[0].2.safe);
+    }
+
+    #[test]
+    fn trusted_apps_round_trip_and_untrust() {
+        let dir = std::env::temp_dir().join(format!("shield-trust-{}", std::process::id()));
+        let path = dir.join("trusted-apps.tsv");
+        let _ = fs::create_dir_all(&dir);
+        let _ = fs::remove_file(&path);
+        let mut trusted = TrustedApps::open(&path).unwrap();
+        assert!(trusted.is_empty());
+        trusted.trust("/usr/bin/curl", 42).unwrap();
+        assert!(trusted.is_trusted("/usr/bin/curl"));
+        let reloaded = TrustedApps::open(&path).unwrap();
+        let entries = reloaded.entries();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "/usr/bin/curl");
+        assert_eq!(entries[0].1.name, "curl");
+        assert_eq!(entries[0].1.first_trusted, 42);
+        trusted.untrust("/usr/bin/curl").unwrap();
+        assert!(!trusted.is_trusted("/usr/bin/curl"));
+        assert!(TrustedApps::open(&path).unwrap().is_empty());
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
     }

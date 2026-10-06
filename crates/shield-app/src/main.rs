@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use eframe::egui;
 use ksni::blocking::TrayMethods;
-use shield_core::{now_unix, scan, Config, Destinations};
+use shield_core::{migrate_store, now_unix, scan, Config, Destinations, TrustedApps};
 
 use crate::gui::ShieldApp;
 use crate::state::{Shared, Tick};
@@ -34,7 +34,16 @@ fn data_dir() -> PathBuf {
 }
 
 fn default_store_path() -> PathBuf {
+    data_dir().join("shield").join("destinations.tsv")
+}
+
+/// The pre-trust store name, read once and converted by `migrate_store`.
+fn default_legacy_store_path() -> PathBuf {
     data_dir().join("shield").join("first-seen.tsv")
+}
+
+fn default_trusted_path() -> PathBuf {
+    data_dir().join("shield").join("trusted-apps.tsv")
 }
 
 fn default_reset_path() -> PathBuf {
@@ -45,16 +54,16 @@ fn default_reset_path() -> PathBuf {
 /// current connections before monitoring starts. Runs once, on the main thread,
 /// while the store has no other owner. The alerts from this scan are dropped on
 /// purpose: the first scan of an emptied store must stay quiet (review A1, A4).
-fn apply_pending_reset(store: &mut Destinations, config: &Config) {
+fn apply_pending_reset(store: &mut Destinations, trusted: &TrustedApps, config: &Config) {
     let reset_path = default_reset_path();
     if !reset_path.exists() {
         return;
     }
     match store.clear() {
         Ok(()) => {
-            let _ = scan(store, now_unix(), config);
+            let _ = scan(store, trusted, now_unix(), config);
             let _ = fs::remove_file(&reset_path);
-            eprintln!("shield: first-seen history reset and re-baselined");
+            eprintln!("shield: destination history reset and re-baselined");
         }
         Err(err) => eprintln!("shield: reset failed: {err}"),
     }
@@ -108,25 +117,52 @@ fn main() {
     // present even for an existing config.
     let _ = config.save(&config_path);
     let store_path = default_store_path();
+    let trusted_path = default_trusted_path();
+
+    // One-time conversion of the legacy IP-keyed store. `open` below reads only
+    // the current format, so nothing is sniffed in place.
+    match migrate_store(default_legacy_store_path(), &store_path) {
+        Ok(true) => eprintln!("shield: migrated first-seen.tsv to destinations.tsv"),
+        Ok(false) => {}
+        Err(err) => eprintln!("shield: store migration failed: {err}"),
+    }
+
+    // A store that cannot be opened must not silently become an in-memory one:
+    // the app still runs, but the failure is carried to the UI and shown (P1-1).
+    let mut startup_error: Option<String> = None;
+    let (mut store, store_persisted) = match Destinations::open(&store_path) {
+        Ok(store) => (store, true),
+        Err(err) => {
+            eprintln!("shield: cannot open store {}: {err}", store_path.display());
+            startup_error = Some(format!("cannot open {}: {err}", store_path.display()));
+            (Destinations::in_memory(), false)
+        }
+    };
+    let trusted = match TrustedApps::open(&trusted_path) {
+        Ok(trusted) => trusted,
+        Err(err) => {
+            eprintln!(
+                "shield: cannot open trust list {}: {err}",
+                trusted_path.display()
+            );
+            if startup_error.is_none() {
+                startup_error = Some(format!("cannot open {}: {err}", trusted_path.display()));
+            }
+            TrustedApps::in_memory()
+        }
+    };
 
     if baseline_only {
-        let (mut store, persisted) = match Destinations::open(&store_path) {
-            Ok(store) => (store, true),
-            Err(err) => {
-                eprintln!("shield: cannot open store {}: {err}", store_path.display());
-                (Destinations::in_memory(), false)
-            }
-        };
-        let _ = scan(&mut store, now_unix(), &config);
-        if persisted {
+        let _ = scan(&mut store, &trusted, now_unix(), &config);
+        if store_persisted {
             println!(
-                "shield: baseline recorded ({} known endpoints) at {}",
+                "shield: baseline recorded ({} known destinations) at {}",
                 store.len(),
                 store_path.display()
             );
         } else {
             println!(
-                "shield: baseline NOT persisted ({} endpoints held in memory only; \
+                "shield: baseline NOT persisted ({} destinations held in memory only; \
                  the store could not be opened)",
                 store.len()
             );
@@ -134,20 +170,8 @@ fn main() {
         return;
     }
 
-    // A store that cannot be opened must not silently become an in-memory one:
-    // the app still runs, but the failure is carried to the UI and shown (P1-1).
-    let (mut store, startup_error) = match Destinations::open(&store_path) {
-        Ok(store) => (store, None),
-        Err(err) => {
-            eprintln!("shield: cannot open store {}: {err}", store_path.display());
-            (
-                Destinations::in_memory(),
-                Some(format!("cannot open {}: {err}", store_path.display())),
-            )
-        }
-    };
-    apply_pending_reset(&mut store, &config);
-    let shared = Arc::new(Shared::new(store, config.clone()));
+    apply_pending_reset(&mut store, &trusted, &config);
+    let shared = Arc::new(Shared::new(store, trusted, config.clone()));
     if test_alert {
         shared.test_alert.store(true, Ordering::SeqCst);
     }

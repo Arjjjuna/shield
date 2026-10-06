@@ -6,7 +6,9 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use shield_core::{classify, now_unix, snapshot, Alert, Config, Connection, Destinations};
+use shield_core::{
+    classify, now_unix, snapshot, Alert, Config, Connection, Destinations, TrustedApps,
+};
 
 use crate::state::{Shared, Tick};
 
@@ -19,11 +21,12 @@ pub const SCAN_INTERVAL: Duration = Duration::from_secs(5);
 /// unwritable store into an empty (calm) tick — a false negative (review A2/Q1).
 fn classify_reporting(
     store: &mut Destinations,
+    trusted: &TrustedApps,
     conns: &[Connection],
     now: u64,
     config: &Config,
 ) -> (Vec<Alert>, Option<String>) {
-    match classify(store, conns, now, config) {
+    match classify(store, trusted, conns, now, config) {
         Ok(alerts) => (alerts, None),
         Err(err) => (Vec::new(), Some(format!("store write failed: {err}"))),
     }
@@ -45,8 +48,10 @@ pub fn spawn(shared: Arc<Shared>, tx: Sender<Tick>) {
         let snap = snapshot();
         let conns = snap.connections;
         let (mut alerts, error) = {
+            // Lock order everywhere is trusted -> store, to avoid deadlock.
+            let trusted = shared.trusted.lock().unwrap_or_else(|e| e.into_inner());
             let mut store = shared.store.lock().unwrap_or_else(|e| e.into_inner());
-            classify_reporting(&mut store, &conns, now_unix(), &config)
+            classify_reporting(&mut store, &trusted, &conns, now_unix(), &config)
         };
         if shared.test_alert.swap(false, Ordering::SeqCst) {
             alerts.push(Alert {
@@ -105,8 +110,14 @@ mod tests {
     #[test]
     fn classify_reporting_is_quiet_when_the_store_is_writable() {
         let mut store = Destinations::in_memory();
-        let (alerts, error) =
-            classify_reporting(&mut store, &[sample_conn()], 1, &Config::default());
+        let trusted = TrustedApps::in_memory();
+        let (alerts, error) = classify_reporting(
+            &mut store,
+            &trusted,
+            &[sample_conn()],
+            1,
+            &Config::default(),
+        );
         assert_eq!(alerts.len(), 1);
         assert!(error.is_none());
     }
@@ -121,11 +132,17 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("destinations.tsv");
         let mut store = Destinations::open(&path).unwrap(); // file missing -> empty
+        let trusted = TrustedApps::in_memory();
         fs::remove_dir_all(&dir).unwrap();
         fs::write(&dir, b"x").unwrap();
 
-        let (alerts, error) =
-            classify_reporting(&mut store, &[sample_conn()], 1, &Config::default());
+        let (alerts, error) = classify_reporting(
+            &mut store,
+            &trusted,
+            &[sample_conn()],
+            1,
+            &Config::default(),
+        );
         assert!(alerts.is_empty());
         assert!(
             error.is_some(),
