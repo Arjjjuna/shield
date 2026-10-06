@@ -110,18 +110,42 @@ fn main() {
     let store_path = default_store_path();
 
     if baseline_only {
-        let mut store =
-            Destinations::open(&store_path).unwrap_or_else(|_| Destinations::in_memory());
+        let (mut store, persisted) = match Destinations::open(&store_path) {
+            Ok(store) => (store, true),
+            Err(err) => {
+                eprintln!("shield: cannot open store {}: {err}", store_path.display());
+                (Destinations::in_memory(), false)
+            }
+        };
         let _ = scan(&mut store, now_unix(), &config);
-        println!(
-            "shield: baseline recorded ({} known endpoints) at {}",
-            store.len(),
-            store_path.display()
-        );
+        if persisted {
+            println!(
+                "shield: baseline recorded ({} known endpoints) at {}",
+                store.len(),
+                store_path.display()
+            );
+        } else {
+            println!(
+                "shield: baseline NOT persisted ({} endpoints held in memory only; \
+                 the store could not be opened)",
+                store.len()
+            );
+        }
         return;
     }
 
-    let mut store = Destinations::open(&store_path).unwrap_or_else(|_| Destinations::in_memory());
+    // A store that cannot be opened must not silently become an in-memory one:
+    // the app still runs, but the failure is carried to the UI and shown (P1-1).
+    let (mut store, startup_error) = match Destinations::open(&store_path) {
+        Ok(store) => (store, None),
+        Err(err) => {
+            eprintln!("shield: cannot open store {}: {err}", store_path.display());
+            (
+                Destinations::in_memory(),
+                Some(format!("cannot open {}: {err}", store_path.display())),
+            )
+        }
+    };
     apply_pending_reset(&mut store, &config);
     let shared = Arc::new(Shared::new(store, config.clone()));
     if test_alert {
@@ -152,10 +176,14 @@ fn main() {
     };
     let app_creator = Box::new(move |cc: &eframe::CreationContext<'_>| {
         theme::apply(&cc.egui_ctx, config.font_size as f32, config.dark_theme);
-        Ok(
-            Box::new(ShieldApp::new(shared, rx, config, config_path, store_path))
-                as Box<dyn eframe::App>,
-        )
+        Ok(Box::new(ShieldApp::new(
+            shared,
+            rx,
+            config,
+            config_path,
+            store_path,
+            startup_error,
+        )) as Box<dyn eframe::App>)
     });
     if let Err(err) = eframe::run_native("Shield", options, app_creator) {
         eprintln!("shield: GUI failed: {err}");

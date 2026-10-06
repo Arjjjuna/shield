@@ -70,6 +70,24 @@ alert cards, live links); HISTORY is refreshed once per second; the CPU meters
 sample `/proc/stat` once per second on the GUI thread. Config edits in SETTINGS
 are written to disk and pushed into `Shared.config`.
 
+## Failure handling
+
+The monitor never fails silently: a failure must never read as `CALM`.
+
+- **Store/scan error.** `classify`'s result is no longer discarded. A failed
+  write carries its message in `Tick.error`; the header turns red (`STORE ERROR`)
+  and a banner explains it — the alert is not quietly dropped.
+- **Monitor death.** If the monitor thread stops, the channel disconnects and
+  `drain()` sets a down flag (`MONITOR DOWN`). If it hangs but stays alive, a
+  missed scan deadline (`> 3 × SCAN_INTERVAL`) shows `MONITOR STALLED`.
+- **Store unopenable at startup.** The app runs in memory rather than silently
+  pretending to persist, and shows `STORE UNAVAILABLE` for the whole session.
+  `Destinations::open` also propagates non-`NotFound` read errors instead of
+  loading a broken store as an empty one.
+
+Mutexes are locked with `unwrap_or_else(|e| e.into_inner())`, so a poisoned lock
+cannot take the monitor down with it.
+
 ## Storage
 
 - **Destination directory:** `~/.local/share/shield/first-seen.tsv` (legacy
@@ -110,6 +128,8 @@ about 10 times a second so it animates smoothly.
 
 - One alert kind: a new destination (remote IP) is alerted once, then known.
   Browsers (quiet) and loopback (quiet) are bypassed entirely.
+- A failed scan or store write is always visible in the UI; it never presents as
+  `CALM`.
 - Userspace only; no privileges beyond reading `/proc` and its own data files.
 - Recorded times are **UTC**; the configured timezone is applied only at display.
 - A reset never alerts: clear + silent re-baseline runs at startup, before
@@ -133,3 +153,6 @@ about 10 times a second so it animates smoothly.
   IP-keyed directory with `reviewed`/`safe` flags.
 - 2026-10-05 — objective written down: **exhaustive, not calm**, with the
   currently accepted gaps listed (see Philosophy); closing them is the roadmap.
+- 2026-10-06 — monitor failure visibility (TODOS P1-1; review A2/Q1): store and
+  scan errors, monitor death/stall, and an unopenable store now surface in the UI
+  instead of showing `CALM`.

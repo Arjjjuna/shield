@@ -225,14 +225,20 @@ impl Destinations {
             path: Some(path.clone()),
             ..Self::default()
         };
-        let Ok(content) = fs::read_to_string(&path) else {
-            return Ok(store);
-        };
-        for line in content.lines() {
-            let fields: Vec<&str> = line.split('\t').collect();
-            if let Some((ip, dest)) = parse_line(&fields) {
-                store.destinations.entry(ip).or_insert(dest);
+        match fs::read_to_string(&path) {
+            Ok(content) => {
+                for line in content.lines() {
+                    let fields: Vec<&str> = line.split('\t').collect();
+                    if let Some((ip, dest)) = parse_line(&fields) {
+                        store.destinations.entry(ip).or_insert(dest);
+                    }
+                }
             }
+            // A missing file is a genuinely empty store. Any other read error is
+            // real and must surface: silently treating an unreadable store as
+            // empty makes a broken store look like "nothing has ever happened".
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err),
         }
         Ok(store)
     }
@@ -864,6 +870,21 @@ mod tests {
         assert!(d2.reviewed && d2.safe);
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn open_surfaces_an_unreadable_store_instead_of_empty() {
+        // A path whose parent component is a file can be neither read nor
+        // written; `open` must report that, not return an empty store that
+        // makes a broken store look like "nothing has ever happened".
+        let dir = std::env::temp_dir().join(format!("shield-open-err-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let blocker = dir.join("blocker");
+        fs::write(&blocker, b"x").unwrap();
+        let path = blocker.join("destinations.tsv");
+        assert!(Destinations::open(&path).is_err());
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

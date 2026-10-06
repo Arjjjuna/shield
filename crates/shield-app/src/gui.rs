@@ -4,7 +4,7 @@ use std::net::IpAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::Receiver;
+use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,13 @@ pub struct ShieldApp {
     store_path: PathBuf,
     really_quit: bool,
     status: String,
+    /// Last store/scan error reported by the monitor, or `None` when healthy.
+    last_error: Option<String>,
+    /// Set when the monitor channel disconnects (the thread stopped).
+    monitor_down: bool,
+    /// A store that failed to open at startup, so the app runs in memory. Kept
+    /// for the whole session so the failure cannot quietly scroll away.
+    startup_error: Option<String>,
     cpu: CpuSampler,
     core_usage: Vec<f32>,
     last_cpu: u64,
@@ -54,6 +61,7 @@ impl ShieldApp {
         config: Config,
         config_path: PathBuf,
         store_path: PathBuf,
+        startup_error: Option<String>,
     ) -> Self {
         Self {
             shared,
@@ -66,6 +74,9 @@ impl ShieldApp {
             store_path,
             really_quit: false,
             status: String::from("STARTING"),
+            last_error: None,
+            monitor_down: false,
+            startup_error,
             cpu: CpuSampler::new(),
             core_usage: Vec::new(),
             last_cpu: 0,
@@ -77,27 +88,105 @@ impl ShieldApp {
     }
 
     fn drain(&mut self) {
-        while let Ok(tick) = self.rx.try_recv() {
-            self.conns = tick.conns;
-            self.last_tick = Instant::now();
-            if tick.baselined {
-                self.status = "BASELINE SET".to_string();
-            } else if tick.alerts.is_empty() {
-                self.status = "CALM".to_string();
-            } else {
-                let n = tick.alerts.len();
-                self.alerts.splice(0..0, tick.alerts.into_iter().rev());
-                self.alerts.truncate(200);
-                self.status = format!("{n} NEW");
+        loop {
+            match self.rx.try_recv() {
+                Ok(tick) => {
+                    self.conns = tick.conns;
+                    self.last_tick = Instant::now();
+                    self.last_error = tick.error;
+                    if tick.baselined {
+                        self.status = "BASELINE SET".to_string();
+                    } else if tick.alerts.is_empty() {
+                        self.status = "CALM".to_string();
+                    } else {
+                        let n = tick.alerts.len();
+                        self.alerts.splice(0..0, tick.alerts.into_iter().rev());
+                        self.alerts.truncate(200);
+                        self.status = format!("{n} NEW");
+                    }
+                }
+                Err(TryRecvError::Empty) => break,
+                // The monitor thread ended (panic or shutdown). If we are not
+                // shutting down, that is a failure, not calm (review A2).
+                Err(TryRecvError::Disconnected) => {
+                    if !self.shared.quit.load(Ordering::SeqCst) {
+                        self.monitor_down = true;
+                    }
+                    break;
+                }
             }
         }
         // Snapshot the first-seen history once per second, newest first.
         let now = now_unix();
         if now > self.records_at {
-            let mut records = self.shared.store.lock().unwrap().entries();
+            let mut records = self
+                .shared
+                .store
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entries();
             records.sort_by_key(|r| std::cmp::Reverse(r.1.first_seen));
             self.records = records;
             self.records_at = now;
+        }
+    }
+
+    /// Whether the monitor has gone quiet for longer than a few cycles while
+    /// still holding the channel open. Catches a hung (not dead) monitor.
+    fn monitor_stalled(&self) -> bool {
+        !self.monitor_down && self.last_tick.elapsed() > SCAN_INTERVAL * 3
+    }
+
+    /// A short, alarming badge label when something is wrong; `None` only when
+    /// the monitor is genuinely healthy. Never `None` for a silent failure.
+    fn health_label(&self) -> Option<&'static str> {
+        if self.shared.quit.load(Ordering::SeqCst) {
+            return None;
+        }
+        if self.monitor_down {
+            Some("MONITOR DOWN")
+        } else if self.monitor_stalled() {
+            Some("MONITOR STALLED")
+        } else if self.startup_error.is_some() {
+            Some("STORE UNAVAILABLE")
+        } else if self.last_error.is_some() {
+            Some("STORE ERROR")
+        } else {
+            None
+        }
+    }
+
+    /// The full sentence shown in the banner whenever `health_label` is set.
+    fn health_detail(&self) -> Option<String> {
+        let label = self.health_label()?;
+        Some(match label {
+            "MONITOR DOWN" => "The monitor thread stopped. No scans are running — \
+                 Shield is NOT watching connections."
+                .to_string(),
+            "MONITOR STALLED" => format!(
+                "No scan for {}s. Shield may not be watching connections.",
+                self.last_tick.elapsed().as_secs()
+            ),
+            "STORE UNAVAILABLE" => format!(
+                "Store unavailable ({}). New destinations are NOT written to disk.",
+                self.startup_error.as_deref().unwrap_or("error")
+            ),
+            _ => self
+                .last_error
+                .clone()
+                .unwrap_or_else(|| "Store error".to_string()),
+        })
+    }
+
+    fn status_color(&self) -> egui::Color32 {
+        if self.health_label().is_some() {
+            theme::red()
+        } else if self.status.ends_with("NEW") {
+            theme::amber()
+        } else if self.status == "CALM" {
+            theme::green()
+        } else {
+            theme::cyan()
         }
     }
 
@@ -106,7 +195,7 @@ impl ShieldApp {
     }
 
     fn save_config(&self) {
-        *self.shared.config.lock().unwrap() = self.config.clone();
+        *self.shared.config.lock().unwrap_or_else(|e| e.into_inner()) = self.config.clone();
         let _ = self.config.save(&self.config_path);
     }
 
@@ -128,16 +217,6 @@ impl ShieldApp {
         match std::fs::write(&path, b"") {
             Ok(()) => self.status = "RESET SCHEDULED".to_string(),
             Err(err) => self.status = format!("RESET FAILED: {err}"),
-        }
-    }
-
-    fn status_color(&self) -> egui::Color32 {
-        if self.status.ends_with("NEW") {
-            theme::amber()
-        } else if self.status == "CALM" {
-            theme::green()
-        } else {
-            theme::cyan()
         }
     }
 
@@ -653,6 +732,7 @@ fn short_exe(exe: Option<&str>) -> String {
 impl eframe::App for ShieldApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.drain();
+        let health = self.health_label();
         let ctx = ui.ctx().clone();
 
         let now = now_unix();
@@ -738,14 +818,17 @@ impl eframe::App for ShieldApp {
                         self.tab = Tab::Settings;
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let color = self.status_color();
+                        let (label, color) = match health {
+                            Some(label) => (label.to_string(), theme::red()),
+                            None => (self.status.clone(), self.status_color()),
+                        };
                         egui::Frame::NONE
                             .fill(color)
                             .corner_radius(egui::CornerRadius::same(2))
                             .inner_margin(egui::Margin::symmetric(8, 3))
                             .show(ui, |ui| {
                                 ui.label(
-                                    egui::RichText::new(&self.status)
+                                    egui::RichText::new(label)
                                         .color(theme::bg())
                                         .strong()
                                         .size(small(ui)),
@@ -756,6 +839,23 @@ impl eframe::App for ShieldApp {
                     });
                 });
             });
+
+        if let Some(detail) = self.health_detail() {
+            egui::Panel::top("health")
+                .frame(
+                    egui::Frame::NONE
+                        .fill(theme::red())
+                        .inner_margin(egui::Margin::symmetric(12, 6)),
+                )
+                .show(ui, |ui| {
+                    ui.label(
+                        egui::RichText::new(format!("!! {detail}"))
+                            .color(theme::bg())
+                            .strong()
+                            .size(small(ui)),
+                    );
+                });
+        }
 
         egui::CentralPanel::default()
             .frame(
@@ -771,5 +871,87 @@ impl eframe::App for ShieldApp {
 
         // Redraw often enough that the header scan ring animates smoothly.
         ctx.request_repaint_after(Duration::from_millis(100));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::Tick;
+    use std::path::PathBuf;
+    use std::sync::mpsc::channel;
+
+    fn app_with(rx: Receiver<Tick>) -> ShieldApp {
+        let shared = Arc::new(Shared::new(
+            shield_core::Destinations::in_memory(),
+            Config::default(),
+        ));
+        ShieldApp::new(
+            shared,
+            rx,
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
+            PathBuf::from("/nonexistent/store.tsv"),
+            None,
+        )
+    }
+
+    fn tick(error: Option<&str>) -> Tick {
+        Tick {
+            conns: Vec::new(),
+            alerts: Vec::new(),
+            baselined: false,
+            error: error.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn drain_detects_a_stopped_monitor() {
+        let (tx, rx) = channel::<Tick>();
+        let mut app = app_with(rx);
+        drop(tx); // the monitor thread ends: the channel disconnects
+        app.drain();
+        assert!(app.monitor_down);
+        assert_eq!(app.health_label(), Some("MONITOR DOWN"));
+    }
+
+    #[test]
+    fn drain_surfaces_a_store_error_tick() {
+        let (tx, rx) = channel::<Tick>();
+        let mut app = app_with(rx);
+        tx.send(tick(Some("store write failed: permission denied")))
+            .unwrap();
+        app.drain();
+        assert_eq!(app.health_label(), Some("STORE ERROR"));
+        assert!(app.health_detail().unwrap().contains("permission denied"));
+    }
+
+    #[test]
+    fn a_healthy_tick_clears_the_error() {
+        let (tx, rx) = channel::<Tick>();
+        let mut app = app_with(rx);
+        tx.send(tick(Some("boom"))).unwrap();
+        tx.send(tick(None)).unwrap();
+        app.drain();
+        assert_eq!(app.health_label(), None);
+    }
+
+    #[test]
+    fn a_startup_store_failure_is_kept_and_shown() {
+        let (_tx, rx) = channel::<Tick>();
+        let shared = Arc::new(Shared::new(
+            shield_core::Destinations::in_memory(),
+            Config::default(),
+        ));
+        let app = ShieldApp::new(
+            shared,
+            rx,
+            Config::default(),
+            PathBuf::from("/nonexistent/config.toml"),
+            PathBuf::from("/nonexistent/store.tsv"),
+            Some("cannot open store: permission denied".to_string()),
+        );
+        assert_eq!(app.health_label(), Some("STORE UNAVAILABLE"));
+        assert!(app.health_detail().unwrap().contains("NOT written to disk"));
     }
 }

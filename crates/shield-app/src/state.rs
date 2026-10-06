@@ -36,4 +36,7 @@ pub struct Tick {
     pub conns: Vec<Connection>,
     pub alerts: Vec<Alert>,
     pub baselined: bool,
+    /// Set when this cycle could not record to the store. Never swallowed: an
+    /// unwritable store must read as an error, not as "calm" (review A2/Q1).
+    pub error: Option<String>,
 }
