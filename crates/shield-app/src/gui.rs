@@ -276,7 +276,13 @@ impl ShieldApp {
                 c.exe.is_some() && (show_local || c.remote.is_none_or(|r| !r.ip().is_loopback()))
             })
             .collect();
-        rows.sort_by(|a, b| a.exe.cmp(&b.exe));
+        rows.sort_by(|a, b| {
+            a.app
+                .as_ref()
+                .map(|x| x.key.as_str())
+                .unwrap_or("")
+                .cmp(b.app.as_ref().map(|x| x.key.as_str()).unwrap_or(""))
+        });
         let trusted: HashSet<String> = self.trusted.iter().map(|(exe, _)| exe.clone()).collect();
 
         ui.horizontal(|ui| {
@@ -407,11 +413,9 @@ impl ShieldApp {
                         }
                         ui.end_row();
                         for row in apps {
+                            ui.label(egui::RichText::new(&row.label).color(theme::cyan()));
                             ui.label(
-                                egui::RichText::new(short_exe(Some(&row.exe))).color(theme::cyan()),
-                            );
-                            ui.label(
-                                egui::RichText::new(&row.exe)
+                                egui::RichText::new(&row.key)
                                     .color(theme::text())
                                     .size(small(ui)),
                             );
@@ -805,11 +809,20 @@ fn draw_links(ui: &mut egui::Ui, rows: &[&Connection], trusted: &HashSet<String>
                 .show(ui, |ui| {
                     let mut i = 0;
                     while i < rows.len() {
-                        let app = short_exe(rows[i].exe.as_deref());
-                        let is_trusted =
-                            rows[i].exe.as_deref().is_some_and(|e| trusted.contains(e));
+                        let key = rows[i].app.as_ref().map(|a| a.key.as_str()).unwrap_or("");
+                        let label = rows[i]
+                            .app
+                            .as_ref()
+                            .map(|a| a.label.clone())
+                            .unwrap_or_else(|| short_exe(rows[i].exe.as_deref()));
+                        let is_trusted = rows[i]
+                            .app
+                            .as_ref()
+                            .is_some_and(|a| trusted.contains(&a.key));
                         let mut j = i;
-                        while j < rows.len() && short_exe(rows[j].exe.as_deref()) == app {
+                        while j < rows.len()
+                            && rows[j].app.as_ref().map(|a| a.key.as_str()).unwrap_or("") == key
+                        {
                             j += 1;
                         }
                         for (k, c) in rows[i..j].iter().enumerate() {
@@ -820,9 +833,9 @@ fn draw_links(ui: &mut egui::Ui, rows: &[&Connection], trusted: &HashSet<String>
                                     theme::cyan()
                                 };
                                 ui.horizontal(|ui| {
-                                    app_badge(ui, &app);
+                                    app_badge(ui, &label);
                                     ui.label(
-                                        egui::RichText::new(app.to_uppercase())
+                                        egui::RichText::new(label.to_uppercase())
                                             .color(color)
                                             .strong(),
                                     );
@@ -879,8 +892,8 @@ fn draw_apps(
     }
     egui::ScrollArea::vertical().id_salt("apps").show(ui, |ui| {
         for row in apps {
-            let name = short_exe(Some(&row.exe));
-            let is_trusted = trusted.contains(&row.exe);
+            let name = row.label.as_str();
+            let is_trusted = trusted.contains(&row.key);
             let color = if is_trusted {
                 theme::green()
             } else {
@@ -895,14 +908,14 @@ fn draw_apps(
                     )
                     .changed()
                 {
-                    *toggle = Some((row.exe.clone(), checked));
+                    *toggle = Some((row.key.clone(), checked));
                 }
                 ui.label(egui::RichText::new(name).color(color).strong());
                 let pid = row.pids.first().copied().unwrap_or(0).to_string();
                 ui.label(egui::RichText::new(pid).color(theme::dim()).size(small(ui)));
             });
             ui.label(
-                egui::RichText::new(&row.exe)
+                egui::RichText::new(&row.key)
                     .color(theme::dim())
                     .size(small(ui)),
             );

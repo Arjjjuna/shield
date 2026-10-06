@@ -15,11 +15,22 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+/// The identity of a running app: `key` is what we store and trust (a verified
+/// script path for interpreter-hosted apps, otherwise the executable path);
+/// `label` is the short name to show.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppId {
+    pub key: String,
+    pub label: String,
+}
+
 /// One observed TCP socket, attributed to a process when possible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Connection {
     pub pid: Option<i32>,
     pub exe: Option<String>,
+    /// The resolved app identity (`None` when the exe is unknown).
+    pub app: Option<AppId>,
     pub local: SocketAddr,
     pub remote: Option<SocketAddr>,
     pub state: String,
@@ -101,55 +112,54 @@ fn parse_proc_net(content: &str) -> Vec<RawConn> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Process {
     pub pid: i32,
-    /// Resolved `/proc/<pid>/exe` path. Only processes whose executable we can
-    /// read appear at all; kernel threads have no exe and are never listed.
-    pub exe: String,
+    /// The resolved app identity. Only processes whose executable we can read
+    /// appear at all; kernel threads have no exe and are never listed.
+    pub app: AppId,
     /// Number of external (remote) TCP connections it currently holds.
     pub connections: usize,
 }
 
-/// One executable's processes collapsed to a single row (for the processes tab
-/// and, later, the trusted-app list).
+/// One app's processes collapsed to a single row (for the processes tab and the
+/// feed's trust pane).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppRow {
-    pub exe: String,
+    /// The app key: a verified script path or an executable path.
+    pub key: String,
+    /// The short name to show.
+    pub label: String,
     pub pids: Vec<i32>,
     pub connections: usize,
 }
 
-/// Collapse a per-pid process list into one row per executable, sorted by
-/// executable path, with pids sorted ascending.
+/// Collapse a per-pid process list into one row per app, sorted by key, with pids
+/// sorted ascending.
 pub fn group_processes(procs: &[Process]) -> Vec<AppRow> {
-    let mut by_exe: HashMap<String, AppRow> = HashMap::new();
+    let mut by_key: HashMap<String, AppRow> = HashMap::new();
     for p in procs {
-        let row = by_exe.entry(p.exe.clone()).or_insert_with(|| AppRow {
-            exe: p.exe.clone(),
+        let row = by_key.entry(p.app.key.clone()).or_insert_with(|| AppRow {
+            key: p.app.key.clone(),
+            label: p.app.label.clone(),
             pids: Vec::new(),
             connections: 0,
         });
         row.pids.push(p.pid);
         row.connections += p.connections;
     }
-    let mut rows: Vec<AppRow> = by_exe.into_values().collect();
-    for row in &mut rows {
-        row.pids.sort_unstable();
-    }
-    rows.sort_by(|a, b| a.exe.cmp(&b.exe));
-    rows
+    finish_rows(by_key)
 }
 
-/// Collapse live connections into one row per executable: unique pids and the
-/// number of external (non-loopback) links, sorted by executable path. Used by
-/// the right feed pane; loopback is never counted.
+/// Collapse live connections into one row per app: unique pids and the number of
+/// external (non-loopback) links, sorted by key. Used by the feed's trust pane.
 pub fn group_connections(conns: &[Connection]) -> Vec<AppRow> {
-    let mut by_exe: HashMap<String, AppRow> = HashMap::new();
+    let mut by_key: HashMap<String, AppRow> = HashMap::new();
     for c in conns {
-        let Some(exe) = c.exe.clone() else { continue };
+        let Some(app) = c.app.as_ref() else { continue };
         if c.remote.is_some_and(|r| r.ip().is_loopback()) {
             continue;
         }
-        let row = by_exe.entry(exe.clone()).or_insert_with(|| AppRow {
-            exe,
+        let row = by_key.entry(app.key.clone()).or_insert_with(|| AppRow {
+            key: app.key.clone(),
+            label: app.label.clone(),
             pids: Vec::new(),
             connections: 0,
         });
@@ -160,43 +170,46 @@ pub fn group_connections(conns: &[Connection]) -> Vec<AppRow> {
             }
         }
     }
-    let mut rows: Vec<AppRow> = by_exe.into_values().collect();
+    finish_rows(by_key)
+}
+
+/// Sort pids within each row and the rows by key.
+fn finish_rows(by_key: HashMap<String, AppRow>) -> Vec<AppRow> {
+    let mut rows: Vec<AppRow> = by_key.into_values().collect();
     for row in &mut rows {
         row.pids.sort_unstable();
     }
-    rows.sort_by(|a, b| a.exe.cmp(&b.exe));
+    rows.sort_by(|a, b| a.key.cmp(&b.key));
     rows
 }
 
-/// Attach per-pid connection counts to raw `(pid, exe)` pairs, sorted by
-/// `(exe, pid)` for a stable list.
+/// Attach per-pid connection counts to resolved apps, sorted by `(key, pid)`.
 fn build_processes(
-    pairs: Vec<(i32, String)>,
+    apps: Vec<(i32, AppId)>,
     connections_by_pid: &HashMap<i32, usize>,
 ) -> Vec<Process> {
-    let mut procs: Vec<Process> = pairs
+    let mut procs: Vec<Process> = apps
         .into_iter()
-        .map(|(pid, exe)| Process {
+        .map(|(pid, app)| Process {
             pid,
-            exe,
+            app,
             connections: connections_by_pid.get(&pid).copied().unwrap_or(0),
         })
         .collect();
-    procs.sort_by(|a, b| a.exe.cmp(&b.exe).then(a.pid.cmp(&b.pid)));
+    procs.sort_by(|a, b| a.app.key.cmp(&b.app.key).then(a.pid.cmp(&b.pid)));
     procs
 }
 
 /// inode -> (pid, exe) attribution for the socket fds we could reach.
 type OwnedInode = HashMap<u64, (i32, Option<String>)>;
 
-/// Walk `/proc` once: map socket inodes to their owning pid+exe, and collect
-/// every process whose executable we can read. Returns `(owners, process
-/// pairs)`; `owners` maps inode -> (pid, exe).
-fn scan_proc() -> (OwnedInode, Vec<(i32, String)>) {
+/// Walk `/proc` once: map socket inodes to their owning pid and resolve every
+/// process whose executable we can read to an `AppId`. Returns `(owners, apps)`.
+fn scan_proc() -> (OwnedInode, HashMap<i32, AppId>) {
     let mut owners: OwnedInode = HashMap::new();
-    let mut procs: Vec<(i32, String)> = Vec::new();
+    let mut apps: HashMap<i32, AppId> = HashMap::new();
     let Ok(entries) = fs::read_dir("/proc") else {
-        return (owners, procs);
+        return (owners, apps);
     };
     for entry in entries.flatten() {
         let name = entry.file_name();
@@ -208,7 +221,7 @@ fn scan_proc() -> (OwnedInode, Vec<(i32, String)>) {
             .ok()
             .map(|p| p.display().to_string());
         if let Some(exe) = &exe {
-            procs.push((pid, exe.clone()));
+            apps.insert(pid, resolve_app(pid, exe));
         }
         let Ok(fds) = fs::read_dir(entry.path().join("fd")) else {
             continue;
@@ -230,11 +243,25 @@ fn scan_proc() -> (OwnedInode, Vec<(i32, String)>) {
             owners.insert(inode, (pid, exe.clone()));
         }
     }
-    (owners, procs)
+    (owners, apps)
+}
+
+/// Resolve a pid's app identity from its executable and command line.
+fn resolve_app(pid: i32, exe: &str) -> AppId {
+    if !is_interpreter(exe) {
+        return AppId {
+            key: exe.to_string(),
+            label: app_name(exe),
+        };
+    }
+    let argv = read_cmdline(pid);
+    let cwd = fs::read_link(format!("/proc/{pid}/cwd")).ok();
+    let path_env = read_path_env(pid);
+    app_identity(exe, &argv, cwd.as_deref(), path_env.as_deref())
 }
 
 /// Attribute the `/proc/net/tcp[6]` rows using a prepared inode -> owner map.
-fn list_connections_with(owners: &OwnedInode) -> Vec<Connection> {
+fn list_connections_with(owners: &OwnedInode, apps: &HashMap<i32, AppId>) -> Vec<Connection> {
     let mut out = Vec::new();
     for path in ["/proc/net/tcp", "/proc/net/tcp6"] {
         let Ok(content) = fs::read_to_string(path) else {
@@ -248,9 +275,11 @@ fn list_connections_with(owners: &OwnedInode) -> Vec<Connection> {
                 Some((pid, exe)) => (Some(*pid), exe.clone()),
                 None => (None, None),
             };
+            let app = pid.and_then(|p| apps.get(&p).cloned());
             out.push(Connection {
                 pid,
                 exe,
+                app,
                 local: raw.local,
                 remote: raw.remote,
                 state: raw.state,
@@ -286,10 +315,10 @@ fn count_connections_by_pid(conns: &[Connection]) -> HashMap<i32, usize> {
 
 /// Snapshot every TCP connection and every readable process of this user.
 pub fn snapshot() -> Snapshot {
-    let (owners, pairs) = scan_proc();
-    let connections = list_connections_with(&owners);
+    let (owners, apps) = scan_proc();
+    let connections = list_connections_with(&owners, &apps);
     let connections_by_pid = count_connections_by_pid(&connections);
-    let processes = build_processes(pairs, &connections_by_pid);
+    let processes = build_processes(apps.into_iter().collect(), &connections_by_pid);
     Snapshot {
         connections,
         processes,
@@ -299,11 +328,12 @@ pub fn snapshot() -> Snapshot {
 /// Snapshot every TCP connection currently visible to this user, attributed to
 /// its owning process where the socket is reachable via `/proc`.
 pub fn list_connections() -> Vec<Connection> {
-    list_connections_with(&scan_proc().0)
+    let (owners, apps) = scan_proc();
+    list_connections_with(&owners, &apps)
 }
 
-/// A known destination: a remote IP a given executable has contacted, with its
-/// verdict. Kept per `(exe, ip)` so trust is per-app (trusted-apps design A2).
+/// A known destination: a remote IP a given app has contacted, with its
+/// verdict. Kept per `(app, ip)` so trust is per-app (trusted-apps design A2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Destination {
     /// First-seen UTC epoch seconds.
@@ -728,6 +758,164 @@ pub fn app_name(exe: &str) -> String {
     exe.rsplit('/').next().unwrap_or(exe).to_string()
 }
 
+/// Whether an executable is a known script interpreter, in which case the real
+/// app is the script it was handed rather than the binary.
+pub fn is_interpreter(exe: &str) -> bool {
+    let name = app_name(exe).to_ascii_lowercase();
+    match name.as_str() {
+        "python" | "python3" | "node" | "nodejs" | "deno" | "bun" | "ruby" | "perl" | "php" => true,
+        // python3.12, python3.11, ... but not python3-config or pythonic.
+        _ => name
+            .strip_prefix("python3.")
+            .is_some_and(|minor| !minor.is_empty() && minor.bytes().all(|b| b.is_ascii_digit())),
+    }
+}
+
+/// A script path found in a command line, before filesystem verification.
+#[derive(Debug, PartialEq, Eq)]
+enum Candidate {
+    /// Contains a `/`; resolve against the cwd if relative.
+    Path(String),
+    /// A bare name; search `PATH`.
+    Name(String),
+}
+
+fn classify_candidate(token: &str) -> Candidate {
+    if token.contains('/') {
+        Candidate::Path(token.to_string())
+    } else {
+        Candidate::Name(token.to_string())
+    }
+}
+
+/// Find the script candidate in a command line, without touching the filesystem.
+///
+/// `argv[0]` is the program as invoked: if it is not an interpreter it names the
+/// app (some processes rename themselves this way). If it is an interpreter, the
+/// script is the first following non-flag argument; `-m MODULE` has no file and
+/// yields none.
+fn script_candidate(argv: &[String]) -> Option<Candidate> {
+    let first = argv.first()?;
+    if !is_interpreter(first) {
+        return Some(classify_candidate(first));
+    }
+    for token in argv.iter().skip(1) {
+        if token == "-m" {
+            return None;
+        }
+        if token.starts_with('-') {
+            continue;
+        }
+        return Some(classify_candidate(token));
+    }
+    None
+}
+
+/// Whether `path` is a readable regular file.
+fn is_readable_file(path: &Path) -> bool {
+    fs::metadata(path).map(|m| m.is_file()).unwrap_or(false) && fs::File::open(path).is_ok()
+}
+
+/// Standard directories searched when a process ships no `PATH`.
+const DEFAULT_PATH: &str = "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin";
+
+/// Resolve a candidate to an absolute, canonicalised readable regular file.
+fn resolve_candidate(
+    candidate: &Candidate,
+    cwd: Option<&Path>,
+    path_env: Option<&str>,
+) -> Option<String> {
+    let resolved = match candidate {
+        Candidate::Path(p) => {
+            let path = Path::new(p);
+            if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                cwd?.join(path)
+            }
+        }
+        Candidate::Name(name) => {
+            // Search the process PATH first, then the standard directories, so a
+            // bare name still resolves when the process shipped an empty PATH.
+            let mut dirs: Vec<PathBuf> = path_env
+                .map(std::env::split_paths)
+                .into_iter()
+                .flatten()
+                .collect();
+            dirs.extend(std::env::split_paths(DEFAULT_PATH));
+            let mut found = None;
+            for dir in dirs {
+                let candidate = dir.join(name);
+                if is_readable_file(&candidate) {
+                    found = Some(candidate);
+                    break;
+                }
+            }
+            found?
+        }
+    };
+    if !is_readable_file(&resolved) {
+        return None;
+    }
+    Some(
+        fs::canonicalize(&resolved)
+            .unwrap_or(resolved)
+            .display()
+            .to_string(),
+    )
+}
+
+/// The identity of a process: the verified script for an interpreter-hosted app,
+/// otherwise the executable. `cwd`/`path_env` resolve bare script names. Fails
+/// closed: an unverifiable candidate falls back to the executable.
+pub fn app_identity(
+    exe: &str,
+    argv: &[String],
+    cwd: Option<&Path>,
+    path_env: Option<&str>,
+) -> AppId {
+    if is_interpreter(exe) {
+        if let Some(candidate) = script_candidate(argv) {
+            if let Some(script) = resolve_candidate(&candidate, cwd, path_env) {
+                return AppId {
+                    label: app_name(&script),
+                    key: script,
+                };
+            }
+        }
+    }
+    AppId {
+        key: exe.to_string(),
+        label: app_name(exe),
+    }
+}
+
+/// The non-empty NUL-separated arguments from `/proc/<pid>/cmdline`.
+fn read_cmdline(pid: i32) -> Vec<String> {
+    let Ok(content) = fs::read_to_string(format!("/proc/{pid}/cmdline")) else {
+        return Vec::new();
+    };
+    content
+        .split('\0')
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// The `PATH` entry from `/proc/<pid>/environ`, if present and readable.
+fn read_path_env(pid: i32) -> Option<String> {
+    let content = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    for entry in content.split(|b| *b == 0) {
+        let Ok(entry) = std::str::from_utf8(entry) else {
+            continue;
+        };
+        if let Some(path) = entry.strip_prefix("PATH=") {
+            return Some(path.to_string());
+        }
+    }
+    None
+}
+
 /// Whether an executable looks like a web browser. Browsers churn through CDN
 /// endpoints constantly, so they are quiet by default.
 pub fn is_browser_exe(exe: &str) -> bool {
@@ -880,6 +1068,9 @@ pub fn classify(
         let Some(exe) = c.exe.as_deref() else {
             continue;
         };
+        let Some(app) = c.app.as_ref() else {
+            continue;
+        };
         let Some(remote) = c.remote else { continue };
         if config.quiet_local && remote.ip().is_loopback() {
             continue;
@@ -887,8 +1078,8 @@ pub fn classify(
         if config.quiet_browsers && is_browser_exe(exe) {
             continue;
         }
-        let is_trusted = trusted.is_trusted(exe);
-        if store.record(exe, remote.ip(), now, is_trusted, is_trusted)? && !is_trusted {
+        let is_trusted = trusted.is_trusted(&app.key);
+        if store.record(&app.key, remote.ip(), now, is_trusted, is_trusted)? && !is_trusted {
             alerts.push(Alert {
                 pid: c.pid,
                 exe: exe.to_string(),
@@ -990,10 +1181,21 @@ mod tests {
         Connection {
             pid: Some(pid),
             exe: Some(exe.to_string()),
+            app: Some(AppId {
+                key: exe.to_string(),
+                label: app_name(exe),
+            }),
             local: "0.0.0.0:0".parse().unwrap(),
             remote: Some(format!("{ip}:{port}").parse().unwrap()),
             state: "01".to_string(),
             inode,
+        }
+    }
+
+    fn app(key: &str) -> AppId {
+        AppId {
+            key: key.to_string(),
+            label: app_name(key),
         }
     }
 
@@ -1317,44 +1519,45 @@ mod tests {
     }
 
     #[test]
-    fn group_processes_collapses_by_executable() {
+    fn group_processes_collapses_by_app_key() {
         let procs = vec![
             Process {
                 pid: 30,
-                exe: "/usr/bin/b".into(),
+                app: app("/usr/bin/b"),
                 connections: 1,
             },
             Process {
                 pid: 10,
-                exe: "/usr/bin/a".into(),
+                app: app("/usr/bin/a"),
                 connections: 2,
             },
             Process {
                 pid: 11,
-                exe: "/usr/bin/a".into(),
+                app: app("/usr/bin/a"),
                 connections: 3,
             },
         ];
         let rows = group_processes(&procs);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].exe, "/usr/bin/a");
+        assert_eq!(rows[0].key, "/usr/bin/a");
+        assert_eq!(rows[0].label, "a");
         assert_eq!(rows[0].pids, vec![10, 11]);
         assert_eq!(rows[0].connections, 5);
-        assert_eq!(rows[1].exe, "/usr/bin/b");
+        assert_eq!(rows[1].key, "/usr/bin/b");
         assert_eq!(rows[1].connections, 1);
     }
 
     #[test]
     fn build_processes_attaches_connection_counts() {
-        let pairs = vec![(2, "/b".to_string()), (1, "/a".to_string())];
+        let apps = vec![(2, app("/b")), (1, app("/a"))];
         let mut counts = HashMap::new();
         counts.insert(1, 4usize);
-        let procs = build_processes(pairs, &counts);
+        let procs = build_processes(apps, &counts);
         assert_eq!(procs.len(), 2);
-        // Sorted by exe, so /a comes first.
-        assert_eq!(procs[0].exe, "/a");
+        // Sorted by key, so /a comes first.
+        assert_eq!(procs[0].app.key, "/a");
         assert_eq!(procs[0].connections, 4);
-        assert_eq!(procs[1].exe, "/b");
+        assert_eq!(procs[1].app.key, "/b");
         assert_eq!(procs[1].connections, 0);
     }
 
@@ -1380,11 +1583,11 @@ mod tests {
         ];
         let rows = group_connections(&conns);
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].exe, "/usr/bin/a");
+        assert_eq!(rows[0].key, "/usr/bin/a");
         // The loopback link is excluded, so only two external links remain.
         assert_eq!(rows[0].connections, 2);
         assert_eq!(rows[0].pids, vec![1]);
-        assert_eq!(rows[1].exe, "/usr/bin/b");
+        assert_eq!(rows[1].key, "/usr/bin/b");
         assert_eq!(rows[1].connections, 1);
     }
 
@@ -1479,6 +1682,129 @@ mod tests {
         assert!(TrustedApps::open(&path).unwrap().is_empty());
         let _ = fs::remove_file(&path);
         let _ = fs::remove_dir(&dir);
+    }
+
+    #[test]
+    fn is_interpreter_matches_only_real_interpreters() {
+        for exe in [
+            "/usr/bin/python3.12",
+            "python",
+            "python3",
+            "/usr/bin/node",
+            "/usr/bin/ruby",
+        ] {
+            assert!(is_interpreter(exe), "{exe} should be an interpreter");
+        }
+        for exe in [
+            "/usr/bin/python3-config",
+            "/usr/bin/pythonic",
+            "/home/x/node_modules",
+            "/usr/bin/curl",
+        ] {
+            assert!(!is_interpreter(exe), "{exe} should not be an interpreter");
+        }
+    }
+
+    #[test]
+    fn script_candidate_reads_the_shapes_we_saw() {
+        let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        // python3 /abs/script
+        assert_eq!(
+            script_candidate(&s(&["/usr/bin/python3", "/usr/bin/blueman-applet"])),
+            Some(Candidate::Path("/usr/bin/blueman-applet".into()))
+        );
+        // python3 -m module has no file
+        assert_eq!(
+            script_candidate(&s(&["/usr/bin/python3", "-m", "proton.vpn.daemon"])),
+            None
+        );
+        // a flag before the script
+        assert_eq!(
+            script_candidate(&s(&["/usr/bin/python3", "-u", "/x/y.py"])),
+            Some(Candidate::Path("/x/y.py".into()))
+        );
+        // a process that renamed argv[0] to a bare name
+        assert_eq!(
+            script_candidate(&s(&["cinnamon-settings"])),
+            Some(Candidate::Name("cinnamon-settings".into()))
+        );
+        // node with a relative script path
+        assert_eq!(
+            script_candidate(&s(&["node", "dist/server/server.js"])),
+            Some(Candidate::Path("dist/server/server.js".into()))
+        );
+        // interpreter with no script at all
+        assert_eq!(script_candidate(&s(&["/usr/bin/python3"])), None);
+    }
+
+    #[test]
+    fn app_identity_verifies_the_script_and_falls_back() {
+        let dir = std::env::temp_dir().join(format!("shield-appid-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let script = dir.join("myscript.py");
+        fs::write(&script, b"print(1)\n").unwrap();
+        let canon = fs::canonicalize(&script).unwrap().display().to_string();
+
+        // interpreter + absolute existing script -> the script identity
+        let id = app_identity(
+            "/usr/bin/python3.12",
+            &["/usr/bin/python3".to_string(), script.display().to_string()],
+            None,
+            None,
+        );
+        assert_eq!(id.key, canon);
+        assert_eq!(id.label, "myscript.py");
+
+        // a script that does not exist -> fall back to the exe
+        let id = app_identity(
+            "/usr/bin/python3.12",
+            &[
+                "/usr/bin/python3".to_string(),
+                dir.join("nope.py").display().to_string(),
+            ],
+            None,
+            None,
+        );
+        assert_eq!(id.key, "/usr/bin/python3.12");
+        assert_eq!(id.label, "python3.12");
+
+        // a bare name resolved via a supplied PATH
+        let id = app_identity(
+            "/usr/bin/python3.12",
+            &["myscript.py".to_string()],
+            None,
+            Some(&dir.display().to_string()),
+        );
+        assert_eq!(id.key, canon);
+        assert_eq!(id.label, "myscript.py");
+
+        // a non-interpreter is itself
+        let id = app_identity("/usr/bin/curl", &[], None, None);
+        assert_eq!(id.key, "/usr/bin/curl");
+        assert_eq!(id.label, "curl");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn trusting_a_script_does_not_trust_the_interpreter() {
+        let mut store = Destinations::in_memory();
+        let mut trusted = TrustedApps::in_memory();
+        let script = "/opt/tools/foo.py";
+        trusted.trust(script, 1).unwrap();
+
+        // The trusted script's pair: recorded safe, no alert.
+        let mut script_conn = conn(1, "/usr/bin/python3.12", "1.2.3.4", 443, 10);
+        script_conn.app = Some(app(script));
+        let alerts = classify(&mut store, &trusted, &[script_conn], 5, &Config::default()).unwrap();
+        assert!(alerts.is_empty());
+        assert!(store.is_known(script, "1.2.3.4".parse().unwrap()));
+
+        // The interpreter itself (fallback identity) is not trusted: it alerts.
+        let plain = conn(2, "/usr/bin/python3.12", "5.6.7.8", 443, 11);
+        let alerts = classify(&mut store, &trusted, &[plain], 6, &Config::default()).unwrap();
+        assert_eq!(alerts.len(), 1);
     }
 
     #[test]

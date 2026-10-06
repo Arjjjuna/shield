@@ -100,6 +100,10 @@ mod tests {
         Connection {
             pid: Some(1),
             exe: Some("/usr/bin/curl".to_string()),
+            app: Some(shield_core::AppId {
+                key: "/usr/bin/curl".to_string(),
+                label: "curl".to_string(),
+            }),
             local: "0.0.0.0:0".parse().unwrap(),
             remote: Some("1.2.3.4:443".parse().unwrap()),
             state: "01".to_string(),

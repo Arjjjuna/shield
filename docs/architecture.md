@@ -45,14 +45,23 @@ automatically. Trusting an app also marks its already-recorded rows safe. Becaus
 the unit includes the app, a trusted app cannot whitelist a destination for an
 untrusted one.
 
+The **app key** is what "app" means everywhere: for an interpreter-hosted process
+it is the verified script path (`python3.12` running `/usr/bin/blueman-applet`
+is `blueman-applet`), otherwise the executable path. So trust is per app, not per
+interpreter (see the app-identity design).
+
 ## Module map
 
 - `crates/shield-core` — no dependencies.
   - `/proc` parsing: `parse_proc_net`, `parse_addr`, `scan_proc` (one walk),
     `list_connections_with`, `snapshot`, `list_connections`, `list_processes`.
-  - Processes: `Process` (per-pid), `AppRow`, `group_processes` (PROCESSES tab)
-    and `group_connections` (the feed's app pane).
-  - Store: `Destinations` (the `(exe, ip)` directory) and `TrustedApps` (the
+  - Processes: `Process` (per-pid, carries an `AppId`), `AppRow` (`key` + `label`
+    + pids + links), `group_processes` (PROCESSES tab) and `group_connections`
+    (the feed's app pane).
+  - Identity: `AppId`, `is_interpreter`, `app_identity` (and its pure
+    `script_candidate`), resolving an interpreter-hosted process to its verified
+    script path.
+  - Store: `Destinations` (the `(app, ip)` directory) and `TrustedApps` (the
     trust registry); `migrate_store` converts the legacy file; `app_name`.
   - Policy: `Config`, `classify`, `is_browser_exe`.
   - Metrics: `CpuSampler` (per-core load from `/proc/stat`).
@@ -101,12 +110,12 @@ cannot take the monitor down with it.
 ## Storage
 
 - **Destination directory:** `~/.local/share/shield/destinations.tsv`,
-  append-only, one line per `(exe, ip)`:
-  `exe \t ip \t ts \t reviewed \t safe`, where `ts` is **UTC epoch seconds**.
-  `mark_app_safe` rewrites the file when an app is trusted. A path containing a
-  tab would corrupt a row (documented limitation).
+  append-only, one line per `(app, ip)`:
+  `app \t ip \t ts \t reviewed \t safe`, where `ts` is **UTC epoch seconds** and
+  `app` is the app key. `mark_app_safe` rewrites the file when an app is trusted.
+  A path containing a tab would corrupt a row (documented limitation).
 - **Trust registry:** `~/.local/share/shield/trusted-apps.tsv`,
-  `exe \t name \t first_trusted`; rewritten on trust/untrust.
+  `app \t name \t first_trusted` (app key); rewritten on trust/untrust.
 - **In memory:** `HashMap<(String, IpAddr), Destination>` and
   `HashMap<String, TrustedApp>`.
 - **Migration:** `migrate_store` converts a legacy `first-seen.tsv` (either the
@@ -132,8 +141,8 @@ an external connection, each with a trust checkbox, PID and path (`APPS // N`).
 Trusted apps and their destinations render green. **HISTORY** /
 **DESTINATIONS**: grid of WHEN / WHO / WHERE / REVIEWED / SAFE, newest first,
 safe rows green. **PROCESSES**: every running executable of this user, one row
-per path, APP / PATH / PIDS (count, pids on hover) / LINKS; read-only and live
-from the scan. **SETTINGS**: policy, display / font size, time / timezone,
+per app, APP (label) / PATH (app key) / PIDS (count, pids on hover) / LINKS;
+read-only and live from the scan. **SETTINGS**: policy, display / font size, time / timezone,
 trusted apps (with untrust), paths, and Reset.
 Shortcuts: Ctrl +/- font, Ctrl 0 reset font, Ctrl T test alert. The
 header ring fills over one `SCAN_INTERVAL` (5 s) and resets; the window repaints
@@ -191,3 +200,8 @@ about 10 times a second so it animates smoothly.
   makes an app's pairs safe and silent while untrusted apps still alert on a new
   pair; `first-seen.tsv` migrated to `destinations.tsv`; FEED is now two panes
   (links | apps with a trust checkbox); SETTINGS lists trusted apps.
+- 2026-10-06 — [app identity](2026-10-06-app-identity-design.md): an
+  interpreter-hosted process (`python3.12`) is identified by its verified script
+  (`blueman-applet`, `cinnamon-settings`), resolved from `cmdline` via cwd/PATH
+  and required to be a readable regular file; the app key becomes the store and
+  trust key, so trust is per script, not per interpreter.
