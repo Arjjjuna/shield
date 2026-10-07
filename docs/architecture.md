@@ -230,6 +230,9 @@ a design decision (ROA-1 / Approach C), not a config flip.
 
 ## Change log
 
+- 2026-10-07 — browsers quiet again: `/proc/<pid>/exe` appends `" (deleted)"` when
+  an update replaces a running binary, which broke `is_browser_exe`; the suffix
+  is stripped when the exe is read (`scan_proc`) and in the matcher.
 - 2026-10-07 — [coverage contract and manual review](2026-10-07-coverage-contract-design.md):
   the HISTORY grid gets a per-row context menu to record a verdict — mark one
   destination safe (`Destinations::mark_pair_safe`), or the whole app (existing

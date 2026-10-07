@@ -219,7 +219,8 @@ fn scan_proc() -> (OwnedInode, HashMap<i32, AppId>) {
         // Read the executable once per process, not once per socket fd.
         let exe = fs::read_link(entry.path().join("exe"))
             .ok()
-            .map(|p| p.display().to_string());
+            .map(|p| p.display().to_string())
+            .map(|path| strip_deleted(&path));
         if let Some(exe) = &exe {
             apps.insert(pid, resolve_app(pid, exe));
         }
@@ -954,10 +955,23 @@ fn read_path_env(pid: i32) -> Option<String> {
     None
 }
 
+/// Strip the kernel's `" (deleted)"` suffix that `/proc/<pid>/exe` reports when
+/// the executable's file has been unlinked — typically a package update that
+/// replaced the binary while the process kept running. Without this, the stale
+/// path breaks browser detection and every basename-based identity.
+fn strip_deleted(path: &str) -> String {
+    path.strip_suffix(" (deleted)").unwrap_or(path).to_string()
+}
+
 /// Whether an executable looks like a web browser. Browsers churn through CDN
 /// endpoints constantly, so they are quiet by default.
 pub fn is_browser_exe(exe: &str) -> bool {
-    let name = exe.rsplit('/').next().unwrap_or(exe).to_ascii_lowercase();
+    let exe = strip_deleted(exe);
+    let name = exe
+        .rsplit('/')
+        .next()
+        .unwrap_or(exe.as_str())
+        .to_ascii_lowercase();
     const BROWSERS: &[&str] = &[
         "firefox",
         "firefox-bin",
@@ -1457,6 +1471,36 @@ mod tests {
         let alerts = classify(&mut store, &trusted, &conns, 1, &Config::default()).unwrap();
         assert!(alerts.is_empty());
         // Not stored, so it cannot whitelist the IP for another app.
+        assert!(store.is_empty());
+    }
+
+    #[test]
+    fn deleted_binaries_are_stripped_before_matching() {
+        // Setproctitle is not the cause here: the kernel appends " (deleted)" to
+        // /proc/<pid>/exe when the binary was replaced on disk under the process.
+        let stale = "/usr/lib/firefox/firefox-bin (deleted)";
+        assert_eq!(strip_deleted(stale), "/usr/lib/firefox/firefox-bin");
+        assert!(is_browser_exe(stale));
+        // A path without the suffix is untouched.
+        assert_eq!(strip_deleted("/usr/bin/curl"), "/usr/bin/curl");
+        assert!(!is_browser_exe("/usr/bin/curl"));
+    }
+
+    #[test]
+    fn a_browser_running_a_deleted_binary_is_bypassed() {
+        // Regression: `quiet_browsers` was not honoured when the browser's
+        // binary had been replaced on disk, because its exe ends in " (deleted)".
+        let mut store = Destinations::in_memory();
+        let trusted = TrustedApps::in_memory();
+        let conns = vec![conn(
+            1,
+            "/usr/lib/firefox/firefox-bin (deleted)",
+            "2.2.2.2",
+            443,
+            10,
+        )];
+        let alerts = classify(&mut store, &trusted, &conns, 1, &Config::default()).unwrap();
+        assert!(alerts.is_empty());
         assert!(store.is_empty());
     }
 
