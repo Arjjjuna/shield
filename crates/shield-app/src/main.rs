@@ -20,7 +20,9 @@ use std::sync::Arc;
 
 use eframe::egui;
 use ksni::blocking::TrayMethods;
-use shield_core::{migrate_store, now_unix, scan, Config, Destinations, TrustedApps};
+use shield_core::{
+    migrate_store, now_unix, scan, strip_deleted, Config, Destinations, TrustedApps,
+};
 
 use crate::gui::ShieldApp;
 use crate::state::{Shared, Tick};
@@ -170,6 +172,14 @@ fn main() {
         return;
     }
 
+    // One monitor owns the store. A second instance splits alerts (each sees the
+    // other's pairs as already known) and can linger on a stale binary after an
+    // update, so a duplicate start exits instead.
+    if let Some(pid) = running_instance() {
+        eprintln!("shield: already running (pid {pid}); use the tray icon to show it");
+        return;
+    }
+
     apply_pending_reset(&mut store, &trusted, &config);
     let shared = Arc::new(Shared::new(store, trusted, config.clone()));
     if test_alert {
@@ -211,5 +221,59 @@ fn main() {
     });
     if let Err(err) = eframe::run_native("Shield", options, app_creator) {
         eprintln!("shield: GUI failed: {err}");
+    }
+}
+
+/// The pid of another running `shield` process, if any. Best effort: any other
+/// process whose executable resolves to the same program. This also catches a
+/// copy left running an older binary — its `/proc/<pid>/exe` reads
+/// `…/shield (deleted)` after an update replaced the file — so the guard holds
+/// across an upgrade.
+fn running_instance() -> Option<i32> {
+    let me = std::process::id() as i32;
+    let self_exe = exe_of(me)?;
+    for entry in fs::read_dir("/proc").ok()?.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|s| s.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        if pid != me && exe_of(pid).is_some_and(|exe| same_program(&exe, &self_exe)) {
+            return Some(pid);
+        }
+    }
+    None
+}
+
+/// `/proc/<pid>/exe`, with the kernel's `" (deleted)"` suffix stripped.
+fn exe_of(pid: i32) -> Option<String> {
+    let path = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    Some(strip_deleted(&path.to_string_lossy()))
+}
+
+/// Whether two executable paths name the same program, ignoring the kernel's
+/// `" (deleted)"` suffix.
+fn same_program(path: &str, self_exe: &str) -> bool {
+    strip_deleted(path) == strip_deleted(self_exe)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn same_program_ignores_the_deleted_suffix() {
+        assert!(same_program(
+            "/usr/local/bin/shield (deleted)",
+            "/usr/local/bin/shield"
+        ));
+        assert!(!same_program("/usr/local/bin/shield", "/usr/bin/shield"));
+    }
+
+    #[test]
+    fn exe_of_a_missing_pid_is_none() {
+        assert!(exe_of(-1).is_none());
     }
 }

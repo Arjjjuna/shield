@@ -185,6 +185,9 @@ about 10 times a second so it animates smoothly.
 - Recorded times are **UTC**; the configured timezone is applied only at display.
 - A reset never alerts: clear + silent re-baseline runs at startup, before
   monitoring, only when the sentinel is present.
+- One instance owns the store: a second start detects the running copy (same
+  executable, tolerating the kernel's `" (deleted)"` suffix) and exits. Two
+  monitors would split alerts — each sees the other's pairs as already known.
 - `shield-core` stays dependency-free and its tests run without network or root.
 
 ## System dev with coding agents
@@ -230,6 +233,10 @@ a design decision (ROA-1 / Approach C), not a config flip.
 
 ## Change log
 
+- 2026-10-07 — single instance: a duplicate `shield` start now detects a running
+  copy (same executable, tolerating `" (deleted)"`) and exits. Two instances
+  share the store, so each saw the other's new pairs as already known and the
+  alerts landed in only one of them.
 - 2026-10-07 — browsers quiet again: `/proc/<pid>/exe` appends `" (deleted)"` when
   an update replaces a running binary, which broke `is_browser_exe`; the suffix
   is stripped when the exe is read (`scan_proc`) and in the matcher.

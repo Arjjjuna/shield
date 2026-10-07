@@ -959,7 +959,7 @@ fn read_path_env(pid: i32) -> Option<String> {
 /// the executable's file has been unlinked — typically a package update that
 /// replaced the binary while the process kept running. Without this, the stale
 /// path breaks browser detection and every basename-based identity.
-fn strip_deleted(path: &str) -> String {
+pub fn strip_deleted(path: &str) -> String {
     path.strip_suffix(" (deleted)").unwrap_or(path).to_string()
 }
 
