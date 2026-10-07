@@ -507,6 +507,23 @@ impl Destinations {
         Ok(())
     }
 
+    /// Mark one `(app, IP)` pair reviewed and safe, rewriting the file. Used when
+    /// the user validates a single destination. Returns whether it changed.
+    pub fn mark_pair_safe(&mut self, exe: &str, ip: IpAddr) -> io::Result<bool> {
+        let changed = match self.destinations.get_mut(&(exe.to_string(), ip)) {
+            Some(dest) if !(dest.reviewed && dest.safe) => {
+                dest.reviewed = true;
+                dest.safe = true;
+                true
+            }
+            _ => false,
+        };
+        if changed {
+            self.rewrite()?;
+        }
+        Ok(changed)
+    }
+
     /// Rewrite the whole file from memory (after a bulk update).
     fn rewrite(&self) -> io::Result<()> {
         let Some(path) = &self.path else {
@@ -1338,6 +1355,57 @@ mod tests {
         assert_eq!(display_name("python3"), "python3_unknown");
         assert_eq!(display_name("/usr/bin/blueman-applet"), "blueman-applet");
         assert_eq!(display_name("/usr/bin/curl"), "curl");
+    }
+
+    #[test]
+    fn mark_pair_safe_marks_only_that_pair() {
+        fn flag(store: &Destinations, ip: IpAddr) -> (bool, bool) {
+            store
+                .entries()
+                .into_iter()
+                .find(|(_, i, _)| *i == ip)
+                .map(|(_, _, d)| (d.reviewed, d.safe))
+                .unwrap()
+        }
+        let ip1: IpAddr = "1.2.3.4".parse().unwrap();
+        let ip2: IpAddr = "5.6.7.8".parse().unwrap();
+        let mut store = Destinations::in_memory();
+        store.record("/usr/bin/curl", ip1, 1, false, false).unwrap();
+        store.record("/usr/bin/curl", ip2, 2, false, false).unwrap();
+
+        assert!(store.mark_pair_safe("/usr/bin/curl", ip1).unwrap());
+        assert_eq!(flag(&store, ip1), (true, true));
+        assert_eq!(
+            flag(&store, ip2),
+            (false, false),
+            "the other pair is untouched"
+        );
+        // A second call has nothing left to change.
+        assert!(!store.mark_pair_safe("/usr/bin/curl", ip1).unwrap());
+    }
+
+    #[test]
+    fn mark_pair_safe_of_an_unknown_pair_is_a_noop() {
+        let mut store = Destinations::in_memory();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        assert!(!store.mark_pair_safe("/usr/bin/curl", ip).unwrap());
+    }
+
+    #[test]
+    fn mark_pair_safe_surfaces_a_write_error() {
+        let dir = std::env::temp_dir().join(format!("shield-pair-safe-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("destinations.tsv");
+        let mut store = Destinations::open(&path).unwrap();
+        let ip: IpAddr = "1.2.3.4".parse().unwrap();
+        store.record("/usr/bin/curl", ip, 1, false, false).unwrap();
+        // Replace the store's directory with a regular file so the rewrite fails.
+        fs::remove_file(&path).unwrap();
+        fs::remove_dir(&dir).unwrap();
+        fs::write(&dir, b"blocked").unwrap();
+        assert!(store.mark_pair_safe("/usr/bin/curl", ip).is_err());
+        let _ = fs::remove_file(&dir);
     }
 
     #[test]

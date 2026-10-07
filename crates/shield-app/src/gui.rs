@@ -13,13 +13,21 @@ use chrono::{Local, TimeZone, Utc};
 use chrono_tz::Tz;
 use eframe::egui;
 use shield_core::{
-    display_name, group_connections, group_processes, now_unix, Alert, AppRow, Config, Connection,
-    CpuSampler, Destination, TrustedApp,
+    display_name, group_connections, group_processes, is_interpreter, now_unix, Alert, AppRow,
+    Config, Connection, CpuSampler, Destination, TrustedApp,
 };
 
 use crate::monitor::SCAN_INTERVAL;
 use crate::state::{Shared, Tick};
 use crate::theme;
+
+/// An action chosen from a HISTORY row's context menu. Collected during the row
+/// loop and applied after it, so the borrow of `records` is released before
+/// `self` is mutated.
+enum HistoryAction {
+    Pair(String, IpAddr),
+    App(String),
+}
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 enum Tab {
@@ -245,6 +253,19 @@ impl ShieldApp {
         self.trusted = trusted.entries();
     }
 
+    /// Mark one destination reviewed and safe, then refresh the snapshot next
+    /// frame. A failure is surfaced like a store error, never swallowed.
+    fn mark_pair_safe(&mut self, app: &str, ip: IpAddr) {
+        let result = {
+            let mut store = self.shared.store.lock().unwrap_or_else(|e| e.into_inner());
+            store.mark_pair_safe(app, ip)
+        };
+        match result {
+            Ok(_) => self.records_at = 0,
+            Err(err) => self.last_error = Some(format!("mark safe failed: {err}")),
+        }
+    }
+
     /// Where the startup reset sentinel lives (next to the store).
     fn reset_request_path(&self) -> PathBuf {
         self.store_path
@@ -284,6 +305,12 @@ impl ShieldApp {
                 .cmp(b.app.as_ref().map(|x| x.key.as_str()).unwrap_or(""))
         });
         let trusted: HashSet<String> = self.trusted.iter().map(|(exe, _)| exe.clone()).collect();
+        let safe_pairs: HashSet<(String, IpAddr)> = self
+            .records
+            .iter()
+            .filter(|(_, _, d)| d.safe)
+            .map(|(exe, ip, _)| (exe.clone(), *ip))
+            .collect();
 
         ui.horizontal(|ui| {
             core_strip(ui, &self.core_usage);
@@ -328,7 +355,7 @@ impl ShieldApp {
         ui.columns(2, |cols| {
             let left = &mut cols[0];
             section(left, &format!("LINKS // {}", rows.len()));
-            draw_links(left, &rows, &trusted);
+            draw_links(left, &rows, &trusted, &safe_pairs);
 
             let right = &mut cols[1];
             draw_apps(right, apps, &trusted, &mut toggle);
@@ -351,38 +378,73 @@ impl ShieldApp {
             );
             return;
         }
-        let records = &self.records;
-        egui::ScrollArea::vertical()
-            .id_salt("history")
-            .show(ui, |ui| {
-                egui::Grid::new("history")
-                    .num_columns(5)
-                    .striped(true)
-                    .spacing([18.0, 5.0])
-                    .show(ui, |ui| {
-                        for h in ["WHEN", "WHO", "WHERE", "REVIEWED", "SAFE"] {
-                            ui.label(egui::RichText::new(h).color(theme::dim()).size(small(ui)));
-                        }
-                        ui.end_row();
-                        for (exe, ip, dest) in records {
-                            ui.label(
-                                egui::RichText::new(format_ts(dest.first_seen, &tz))
-                                    .color(theme::text())
-                                    .size(small(ui)),
-                            );
-                            ui.label(egui::RichText::new(display_name(exe)).color(theme::cyan()));
-                            let ip_color = if dest.safe {
-                                theme::green()
-                            } else {
-                                theme::text()
-                            };
-                            ui.label(egui::RichText::new(ip.to_string()).color(ip_color));
-                            flag(ui, dest.reviewed, theme::text());
-                            flag(ui, dest.safe, theme::green());
+        let mut action: Option<HistoryAction> = None;
+        {
+            let records = &self.records;
+            egui::ScrollArea::vertical()
+                .id_salt("history")
+                .show(ui, |ui| {
+                    egui::Grid::new("history")
+                        .num_columns(5)
+                        .striped(true)
+                        .spacing([18.0, 5.0])
+                        .show(ui, |ui| {
+                            for h in ["WHEN", "WHO", "WHERE", "REVIEWED", "SAFE"] {
+                                ui.label(
+                                    egui::RichText::new(h).color(theme::dim()).size(small(ui)),
+                                );
+                            }
                             ui.end_row();
-                        }
-                    });
-            });
+                            for (exe, ip, dest) in records {
+                                let ip = *ip;
+                                ui.label(
+                                    egui::RichText::new(format_ts(dest.first_seen, &tz))
+                                        .color(theme::text())
+                                        .size(small(ui)),
+                                );
+                                let who = ui.label(
+                                    egui::RichText::new(display_name(exe)).color(theme::cyan()),
+                                );
+                                who.context_menu(|ui| {
+                                    if ui.button("Mark safe: this destination only").clicked() {
+                                        action = Some(HistoryAction::Pair(exe.clone(), ip));
+                                        ui.close();
+                                    }
+                                    if ui
+                                        .button("Mark safe: this app, every destination")
+                                        .clicked()
+                                    {
+                                        action = Some(HistoryAction::App(exe.clone()));
+                                        ui.close();
+                                    }
+                                    if is_interpreter(exe) {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                "trusts every app under this interpreter",
+                                            )
+                                            .color(theme::amber())
+                                            .size(small(ui)),
+                                        );
+                                    }
+                                });
+                                let ip_color = if dest.safe {
+                                    theme::green()
+                                } else {
+                                    theme::text()
+                                };
+                                ui.label(egui::RichText::new(ip.to_string()).color(ip_color));
+                                flag(ui, dest.reviewed, theme::text());
+                                flag(ui, dest.safe, theme::green());
+                                ui.end_row();
+                            }
+                        });
+                });
+        }
+        match action {
+            Some(HistoryAction::Pair(app, ip)) => self.mark_pair_safe(&app, ip),
+            Some(HistoryAction::App(app)) => self.set_trust(&app, true),
+            None => {}
+        }
     }
 
     fn processes(&mut self, ui: &mut egui::Ui) {
@@ -797,7 +859,12 @@ fn app_badge(ui: &mut egui::Ui, name: &str) {
 
 /// The left feed pane: live links grouped by app, IPs green when the app is
 /// trusted.
-fn draw_links(ui: &mut egui::Ui, rows: &[&Connection], trusted: &HashSet<String>) {
+fn draw_links(
+    ui: &mut egui::Ui,
+    rows: &[&Connection],
+    trusted: &HashSet<String>,
+    safe_pairs: &HashSet<(String, IpAddr)>,
+) {
     egui::ScrollArea::vertical()
         .id_salt("conns")
         .show(ui, |ui| {
@@ -850,7 +917,13 @@ fn draw_links(ui: &mut egui::Ui, rows: &[&Connection], trusted: &HashSet<String>
                                 .remote
                                 .map(|r| r.to_string())
                                 .unwrap_or_else(|| "-".into());
-                            let dcol = if is_trusted {
+                            let pair_safe = match (&c.app, c.remote) {
+                                (Some(app), Some(r)) => {
+                                    safe_pairs.contains(&(app.key.clone(), r.ip()))
+                                }
+                                _ => false,
+                            };
+                            let dcol = if is_trusted || pair_safe {
                                 theme::green()
                             } else {
                                 theme::text()

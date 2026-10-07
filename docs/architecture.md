@@ -45,6 +45,11 @@ automatically. Trusting an app also marks its already-recorded rows safe. Becaus
 the unit includes the app, a trusted app cannot whitelist a destination for an
 untrusted one.
 
+A second, narrower verdict sits on the pair itself. **Mark safe this destination
+only** records `reviewed = safe = true` on one `(app, IP)`. It does **not**
+change alerting — the pair is already recorded and therefore already silent — it
+records the user's judgement, shown green in HISTORY and in the FEED's link pane.
+
 The **app key** is what "app" means everywhere: for an interpreter-hosted process
 it is the verified script path (`python3.12` running `/usr/bin/blueman-applet`
 is `blueman-applet`), otherwise the executable path. So trust is per app, not per
@@ -119,8 +124,9 @@ cannot take the monitor down with it.
 - **Destination directory:** `~/.local/share/shield/destinations.tsv`,
   append-only, one line per `(app, ip)`:
   `app \t ip \t ts \t reviewed \t safe`, where `ts` is **UTC epoch seconds** and
-  `app` is the app key. `mark_app_safe` rewrites the file when an app is trusted.
-  A path containing a tab would corrupt a row (documented limitation).
+  `app` is the app key. `mark_app_safe` (whole app) and `mark_pair_safe` (one
+  pair) rewrite the file when a verdict changes. A path containing a tab would
+  corrupt a row (documented limitation).
 - **Trust registry:** `~/.local/share/shield/trusted-apps.tsv`,
   `app \t name \t first_trusted` (app key); rewritten on trust/untrust.
 - **In memory:** `HashMap<(String, IpAddr), Destination>` and
@@ -145,9 +151,11 @@ egui HUD with a header (status badge + a small **scan-cycle ring**) and four
 tabs. **FEED**: core level meters + separator, alert cards, then two panes —
 left, live links grouped by app (the `LINKS // N` heading); right, the apps with
 an external connection, each with a trust checkbox, PID and path (`APPS // N`).
-Trusted apps and their destinations render green. **HISTORY** /
-**DESTINATIONS**: grid of WHEN / WHO / WHERE / REVIEWED / SAFE, newest first,
-safe rows green. **PROCESSES**: every running executable of this user, one row
+Trusted apps render green, and so does a destination whose pair is marked safe.
+**HISTORY** / **DESTINATIONS**: grid of WHEN / WHO / WHERE / REVIEWED / SAFE,
+newest first, safe rows green; right-click a row's app name for the review menu —
+**mark safe this destination only**, or **mark safe this app, every
+destination** (the latter warns when the key is a bare interpreter). **PROCESSES**: every running executable of this user, one row
 per app, APP (label) / PATH (app key) / PIDS (count, pids on hover) / LINKS;
 read-only and live from the scan. **SETTINGS**: policy, display / font size, time / timezone,
 trusted apps (with untrust), paths, and Reset.
@@ -179,8 +187,58 @@ about 10 times a second so it animates smoothly.
   monitoring, only when the sentinel is present.
 - `shield-core` stays dependency-free and its tests run without network or root.
 
+## System dev with coding agents
+
+Shield is not an app the agent can verify end to end: part of the work sits
+behind a **privilege boundary the agent must never cross**. That one fact shapes
+how this project is built, so it is written down.
+
+**The boundary.** The coding agent takes no privileged action — `opencode.jsonc`
+denies `sudo`/`doas` and privileged tools, and the agent holds no credential to
+use them. Privileges belong to the *deployed service*, granted narrowly through
+its own unit file, never to the development session. v1 leans on this: it is
+**userspace only**, reading `/proc` and its own data files. The next step (TODOS
+ROA-1, the deferred eBPF exec capture) needs `CAP_BPF`/`CAP_PERFMON` — still not
+root, still a service the user installs, inspects, and can revoke.
+
+**What that changes.**
+
+- **Design for the seam.** Anything privileged sits behind an interface (for
+  eBPF, `ExecSource`) so everything downstream — identity, `classify`, the store,
+  the UI — is exercised with fakes or a replay of recorded events. Testability
+  without privilege is a requirement, not a nicety.
+- **Split the verification loop.** The agent does all the unprivileged work:
+  `/check` (fmt, clippy, tests), compiling the BPF object, and writing the unit
+  file and the install/test scripts. The **human** installs the service and runs
+  the live privileged test — deliberately, and rarely.
+- **Capability grants are reviewed artifacts.** A unit file's
+  `AmbientCapabilities` is versioned and read like code, kept to the minimum
+  (`CAP_BPF` + `CAP_PERFMON`), never a blanket root.
+- **State what was actually verified.** A change says which parts ran here and
+  which only the human could exercise, so an unverified path is never mistaken
+  for a tested one.
+- **Respect the risk asymmetry.** A bug in the privileged slice can break the
+  machine, not just the app. This is why there is no disposable break-anything
+  box: on this machine the computer cannot be broken at will, so the privileged
+  step stays human, deliberate, and rare.
+
+This is less a limitation of the agent than a different discipline:
+agent-assisted systems development needs a **capability-gated verification
+loop**, and the workflow pack — which assumes the agent verifies end to end —
+does not yet model that. It also explains why v1 is userspace-only: lifting it is
+a design decision (ROA-1 / Approach C), not a config flip.
+
 ## Change log
 
+- 2026-10-07 — [coverage contract and manual review](2026-10-07-coverage-contract-design.md):
+  the HISTORY grid gets a per-row context menu to record a verdict — mark one
+  destination safe (`Destinations::mark_pair_safe`), or the whole app (existing
+  trust) — and the FEED colours a pair-marked-safe destination green. No rename
+  or aliasing; naming waits on ROA-1.
+- 2026-10-07 — documented **System dev with coding agents**: the privilege
+  boundary between the agent and the deployed service, and the capability-gated
+  verification loop it forces (seams, human-run privileged tests, minimal
+  `AmbientCapabilities`). Opened by TODOS ROA-1 (eBPF exec capture).
 - 2026-10-07 — alert identity: an alert now names the resolved app (`Alert.app`)
   instead of the raw executable, so interpreter-hosted apps no longer alert as
   `python3.12`; an interpreter whose script cannot be resolved is shown as
