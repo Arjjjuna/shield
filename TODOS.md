@@ -17,11 +17,6 @@ audit).
   Effort: ~0.5 day / ~20 min. Acceptance: killing the monitor thread shows an
   error in the UI; a read-only store path shows an error instead of "calm".
 
-- [ ] **P1-2 Close-to-tray guard** — resolves A3. Only cancel-close + hide when a
-  tray actually spawned; otherwise close means quit, so the window can never be
-  stranded. Files: `crates/shield-app/src/main.rs`, `gui.rs`. Effort: ~1 h /
-  ~5 min. Acceptance: with the tray disabled, closing the window exits.
-
 - [ ] **P1-3 Real attribution + monitor tests** — resolves T1, T2. Add a
   Linux-gated integration test that opens a socket and asserts it is attributed
   to the test process; add a monitor test that a `Tick` is emitted and that

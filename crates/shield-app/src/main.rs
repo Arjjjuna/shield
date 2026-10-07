@@ -14,6 +14,7 @@ mod tray;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::channel;
 use std::sync::Arc;
@@ -172,11 +173,18 @@ fn main() {
         return;
     }
 
-    // One monitor owns the store. A second instance splits alerts (each sees the
-    // other's pairs as already known) and can linger on a stale binary after an
-    // update, so a duplicate start exits instead.
+    // One monitor owns the store: two instances split alerts (each sees the
+    // other's pairs as already known). A duplicate start says so and exits; the
+    // user quits the running one and relaunches.
     if let Some(pid) = running_instance() {
-        eprintln!("shield: already running (pid {pid}); use the tray icon to show it");
+        let message =
+            format!("Shield is already running (pid {pid}).\nQuit it before launching a new one.");
+        if hidden {
+            // Autostart: no dialog at login; log and leave the running copy.
+            eprintln!("shield: {message}");
+        } else {
+            warn_already_running(&message);
+        }
         return;
     }
 
@@ -257,6 +265,18 @@ fn exe_of(pid: i32) -> Option<String> {
 /// `" (deleted)"` suffix.
 fn same_program(path: &str, self_exe: &str) -> bool {
     strip_deleted(path) == strip_deleted(self_exe)
+}
+
+/// Show the "already running" message in a desktop dialog, so a menu launch does
+/// not fail silently. Falls back to stderr when no dialog tool is available.
+fn warn_already_running(message: &str) {
+    let shown = Command::new("zenity")
+        .args(["--warning", "--title", "Shield", "--text", message])
+        .status()
+        .is_ok();
+    if !shown {
+        eprintln!("shield: {message}");
+    }
 }
 
 #[cfg(test)]
