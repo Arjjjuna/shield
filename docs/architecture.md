@@ -50,6 +50,12 @@ it is the verified script path (`python3.12` running `/usr/bin/blueman-applet`
 is `blueman-applet`), otherwise the executable path. So trust is per app, not per
 interpreter (see the app-identity design).
 
+An alert names the resolved app (`Alert.app`), falling back to the raw
+executable only when there is none. When the script cannot be resolved the
+identity stays the interpreter, but the name is marked `_unknown`
+(`python3.12_unknown`) so the gap is visible — an unresolved interpreter is
+exactly what a script hiding its name looks like.
+
 ## Module map
 
 - `crates/shield-core` — no dependencies.
@@ -60,7 +66,8 @@ interpreter (see the app-identity design).
     (the feed's app pane).
   - Identity: `AppId`, `is_interpreter`, `app_identity` (and its pure
     `script_candidate`), resolving an interpreter-hosted process to its verified
-    script path.
+    script path; `display_name` renders an unresolved interpreter as
+    `<interp>_unknown`.
   - Store: `Destinations` (the `(app, ip)` directory) and `TrustedApps` (the
     trust registry); `migrate_store` converts the legacy file; `app_name`.
   - Policy: `Config`, `classify`, `is_browser_exe`.
@@ -174,6 +181,10 @@ about 10 times a second so it animates smoothly.
 
 ## Change log
 
+- 2026-10-07 — alert identity: an alert now names the resolved app (`Alert.app`)
+  instead of the raw executable, so interpreter-hosted apps no longer alert as
+  `python3.12`; an interpreter whose script cannot be resolved is shown as
+  `python3.12_unknown`, making the miss visible.
 - 2026-10-04 — [initial design](2026-10-04-shield-design.md): `/proc` monitor,
   first-seen store, egui UI, tray, packaging.
 - 2026-10-05 — [first-seen history, reset, separator](2026-10-05-first-seen-history-design.md):

@@ -350,7 +350,11 @@ pub struct Destination {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Alert {
     pub pid: Option<i32>,
+    /// The raw executable. For an interpreter-hosted app this is the
+    /// interpreter, so prefer `app` for display.
     pub exe: String,
+    /// The resolved app identity, when known.
+    pub app: Option<AppId>,
     pub remote: SocketAddr,
     pub first_seen_unix: u64,
 }
@@ -362,10 +366,14 @@ impl Alert {
             .pid
             .map(|p| p.to_string())
             .unwrap_or_else(|| "-".to_string());
+        let who = self
+            .app
+            .as_ref()
+            .map(|app| app.label.clone())
+            .unwrap_or_else(|| app_name(&self.exe));
         format!(
-            "new destination {} - first contacted by {} (pid {pid})",
+            "new destination {} - first contacted by {who} (pid {pid})",
             self.remote.ip(),
-            self.exe
         )
     }
 }
@@ -758,6 +766,19 @@ pub fn app_name(exe: &str) -> String {
     exe.rsplit('/').next().unwrap_or(exe).to_string()
 }
 
+/// The name to show for a resolved identifier. When the identifier is still a
+/// bare interpreter the real script could not be resolved, so the name is
+/// marked `_unknown` (`python3.12_unknown`) rather than passing the interpreter
+/// off as the app.
+pub fn display_name(identifier: &str) -> String {
+    let name = app_name(identifier);
+    if is_interpreter(identifier) {
+        format!("{name}_unknown")
+    } else {
+        name
+    }
+}
+
 /// Whether an executable is a known script interpreter, in which case the real
 /// app is the script it was handed rather than the binary.
 pub fn is_interpreter(exe: &str) -> bool {
@@ -886,7 +907,7 @@ pub fn app_identity(
     }
     AppId {
         key: exe.to_string(),
-        label: app_name(exe),
+        label: display_name(exe),
     }
 }
 
@@ -1083,6 +1104,7 @@ pub fn classify(
             alerts.push(Alert {
                 pid: c.pid,
                 exe: exe.to_string(),
+                app: c.app.clone(),
                 remote,
                 first_seen_unix: now,
             });
@@ -1266,6 +1288,56 @@ mod tests {
 
         let again = classify(&mut store, &trusted, &conns, 2, &Config::default()).unwrap();
         assert!(again.is_empty());
+    }
+
+    #[test]
+    fn alert_names_the_app_not_the_interpreter() {
+        let mut store = Destinations::in_memory();
+        let trusted = TrustedApps::in_memory();
+        // blueman-applet is a python script: the exe is the interpreter, the app
+        // is the resolved script. The alert must name the app, not python3.12.
+        let mut resolved = conn(42, "/usr/bin/python3.12", "1.2.3.4", 443, 10);
+        resolved.app = Some(app("/usr/bin/blueman-applet"));
+        // An interpreter Shield could not resolve keeps the interpreter name,
+        // marked `_unknown` so the gap is visible instead of hidden.
+        let mut unresolved = conn(43, "/usr/bin/python3.12", "5.6.7.8", 443, 11);
+        unresolved.app = Some(AppId {
+            key: "/usr/bin/python3.12".to_string(),
+            label: display_name("/usr/bin/python3.12"),
+        });
+
+        let alerts = classify(
+            &mut store,
+            &trusted,
+            &[resolved, unresolved],
+            1,
+            &Config::default(),
+        )
+        .unwrap();
+        assert_eq!(alerts.len(), 2);
+        let resolved_alert = alerts
+            .iter()
+            .find(|a| a.remote.ip().to_string() == "1.2.3.4")
+            .unwrap();
+        assert_eq!(resolved_alert.app.as_ref().unwrap().label, "blueman-applet");
+        assert!(resolved_alert.describe().contains("blueman-applet"));
+        let unresolved_alert = alerts
+            .iter()
+            .find(|a| a.remote.ip().to_string() == "5.6.7.8")
+            .unwrap();
+        assert_eq!(
+            unresolved_alert.app.as_ref().unwrap().label,
+            "python3.12_unknown"
+        );
+        assert!(unresolved_alert.describe().contains("python3.12_unknown"));
+    }
+
+    #[test]
+    fn display_name_marks_unresolved_interpreters() {
+        assert_eq!(display_name("/usr/bin/python3.12"), "python3.12_unknown");
+        assert_eq!(display_name("python3"), "python3_unknown");
+        assert_eq!(display_name("/usr/bin/blueman-applet"), "blueman-applet");
+        assert_eq!(display_name("/usr/bin/curl"), "curl");
     }
 
     #[test]
@@ -1767,7 +1839,7 @@ mod tests {
             None,
         );
         assert_eq!(id.key, "/usr/bin/python3.12");
-        assert_eq!(id.label, "python3.12");
+        assert_eq!(id.label, "python3.12_unknown");
 
         // a bare name resolved via a supplied PATH
         let id = app_identity(

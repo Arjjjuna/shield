@@ -13,8 +13,8 @@ use chrono::{Local, TimeZone, Utc};
 use chrono_tz::Tz;
 use eframe::egui;
 use shield_core::{
-    group_connections, group_processes, now_unix, Alert, AppRow, Config, Connection, CpuSampler,
-    Destination, TrustedApp,
+    display_name, group_connections, group_processes, now_unix, Alert, AppRow, Config, Connection,
+    CpuSampler, Destination, TrustedApp,
 };
 
 use crate::monitor::SCAN_INTERVAL;
@@ -370,9 +370,7 @@ impl ShieldApp {
                                     .color(theme::text())
                                     .size(small(ui)),
                             );
-                            ui.label(
-                                egui::RichText::new(short_exe(Some(exe))).color(theme::cyan()),
-                            );
+                            ui.label(egui::RichText::new(display_name(exe)).color(theme::cyan()));
                             let ip_color = if dest.safe {
                                 theme::green()
                             } else {
@@ -738,12 +736,12 @@ fn alert_card(ui: &mut egui::Ui, alert: &Alert) -> bool {
         .pid
         .map(|p| p.to_string())
         .unwrap_or_else(|| "-".into());
-    let detail = format!(
-        "{}  pid {}  ->  {}",
-        short_exe(Some(&alert.exe)),
-        pid,
-        alert.remote
-    );
+    let who = alert
+        .app
+        .as_ref()
+        .map(|app| app.label.clone())
+        .unwrap_or_else(|| short_exe(Some(&alert.exe)));
+    let detail = format!("{who}  pid {pid}  ->  {}", alert.remote);
     let age = now_unix().saturating_sub(alert.first_seen_unix);
     let mut closed = false;
     egui::Frame::NONE

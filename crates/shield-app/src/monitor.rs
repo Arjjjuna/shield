@@ -57,6 +57,7 @@ pub fn spawn(shared: Arc<Shared>, tx: Sender<Tick>) {
             alerts.push(Alert {
                 pid: Some(std::process::id() as i32),
                 exe: "shield-self-test".to_string(),
+                app: None,
                 remote: "203.0.113.9:443".parse().unwrap(),
                 first_seen_unix: now_unix(),
             });
